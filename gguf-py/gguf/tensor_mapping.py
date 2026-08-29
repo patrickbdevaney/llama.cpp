@@ -1246,6 +1246,34 @@ class TensorNameMap:
             "model.layers.{bid}.self_attn.indexer.weights_proj", # DSA
         ),
 
+        # GLM-5.3-Flash mHC. Two sites per layer (attention, FFN), each with a projection
+        # `fn` [(2+H)*H, H*D], a `base` bias and 3 learned `scale`s. Note GLM-5.3 is natively
+        # multimodal, so the text stack sits under `model.language_model.` rather than
+        # `model.layers.` - the converter strips that, but map both so a raw checkpoint works.
+        MODEL_TENSOR.HC_ATTN_FN: (
+            "model.layers.{bid}.hc_attn_fn",
+            "model.language_model.layers.{bid}.hc_attn_fn",
+        ),
+        MODEL_TENSOR.HC_ATTN_BASE: (
+            "model.layers.{bid}.hc_attn_base",
+            "model.language_model.layers.{bid}.hc_attn_base",
+        ),
+        MODEL_TENSOR.HC_ATTN_SCALE: (
+            "model.layers.{bid}.hc_attn_scale",
+            "model.language_model.layers.{bid}.hc_attn_scale",
+        ),
+        MODEL_TENSOR.HC_FFN_FN: (
+            "model.layers.{bid}.hc_ffn_fn",
+            "model.language_model.layers.{bid}.hc_ffn_fn",
+        ),
+        MODEL_TENSOR.HC_FFN_BASE: (
+            "model.layers.{bid}.hc_ffn_base",
+            "model.language_model.layers.{bid}.hc_ffn_base",
+        ),
+        MODEL_TENSOR.HC_FFN_SCALE: (
+            "model.layers.{bid}.hc_ffn_scale",
+            "model.language_model.layers.{bid}.hc_ffn_scale",
+        ),
         MODEL_TENSOR.INDEXER_ATTN_K: (
             "model.layers.{bid}.self_attn.indexer.wk", # DSA
         ),
