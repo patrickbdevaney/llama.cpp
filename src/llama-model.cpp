@@ -2571,6 +2571,15 @@ void llama_model::load_hparams(llama_model_loader & ml) {
                 {
                     const char * e = getenv("GLM5_DSA");
                     hparams.dsa_enabled = e && *e && *e != '0';
+                    if (hparams.dsa_enabled) {
+                        // kv_lora + indexer key + gate. The +1 "valid" flag the reference packs
+                        // alongside is redundant here: llama.cpp already tracks which cache
+                        // slots are populated, so carrying it would waste a row element and
+                        // invite the two notions of validity to disagree.
+                        hparams.n_embd_head_k_dsa = hparams.n_lora_kv + 2*hparams.indexer_head_size;
+                        LLAMA_LOG_INFO("%s: DSA enabled - K row %u -> %u on attention layers\n",
+                                       __func__, hparams.n_lora_kv, hparams.n_embd_head_k_dsa);
+                    }
                 }
 
                 // mHC

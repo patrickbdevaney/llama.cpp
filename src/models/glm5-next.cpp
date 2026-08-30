@@ -411,6 +411,32 @@ llm_build_glm5_next::llm_build_glm5_next(const llama_model & model, const llm_gr
                 ggml_tensor * Kcur = ggml_reshape_3d(ctx0, kv_cmpr, kv_lora_rank, 1, n_tokens);
                 ggml_tensor * Vcur = Kcur;
 
+                // DSA (opt-in): carry the indexer key and gate in the K row so decode can score
+                // cached tokens. Q is zero-padded to match, so the extra dimensions contribute
+                // exactly nothing to the attention scores.
+                //
+                // V is deliberately NOT widened and no longer aliases K: wv_b expands from the
+                // compressed latent, so a wider V would feed it the indexer state as if it were
+                // value content.
+                if (hparams.dsa_enabled && layer.indexer_attn_k && layer.indexer_kpool_gate) {
+                    const int64_t ihd = hparams.indexer_head_size;
+
+                    ggml_tensor * ik = ggml_mul_mat(ctx0, layer.indexer_attn_k, cur);
+                    ik = ggml_norm(ctx0, ik, 1e-6f);
+                    ik = ggml_add(ctx0, ggml_mul(ctx0, ik, layer.indexer_k_norm),
+                                  layer.indexer_k_norm_b);
+                    ggml_tensor * ig = ggml_mul_mat(ctx0, layer.indexer_kpool_gate, cur);
+
+                    ggml_tensor * extra = ggml_concat(ctx0, ik, ig, 0);          // [2*ihd, T]
+                    extra = ggml_reshape_3d(ctx0, extra, 2*ihd, 1, n_tokens);
+                    Kcur  = ggml_concat(ctx0, Kcur, extra, 0);                   // [kv_lora+2*ihd, 1, T]
+
+                    ggml_tensor * pad = ggml_new_tensor_3d(ctx0, Qcur->type, 2*ihd, n_head, n_tokens);
+                    pad = ggml_scale(ctx0, pad, 0.0f);
+                    Qcur = ggml_concat(ctx0, Qcur, pad, 0);
+                    cb(Kcur, "dsa_k_widened", il);
+                }
+
                 cur = build_attn(inp_attn_k, layer.wo, NULL, Qcur, Kcur, Vcur,
                                  nullptr, nullptr, layer.wv_b, kq_scale_mla, il);
             } else {

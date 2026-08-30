@@ -86,6 +86,14 @@ uint32_t llama_hparams::n_embd_out() const {
 
 uint32_t llama_hparams::n_embd_head_k(uint32_t il) const {
     if (il < n_layer) {
+        // DSA (opt-in): the attention layers carry the indexer's key and gate alongside the
+        // compressed MLA latent, so their K row is wider. Q is zero-padded to match, which
+        // leaves attention scores unchanged - the extra dimensions contribute nothing. Costs
+        // ~50% on the QK matmul for those layers; see research/DSA_LLAMACPP.md for why the
+        // alternative (a separate cache stream) is more shared-code surface, not less.
+        if (dsa_enabled && n_embd_head_k_dsa != 0 && !is_recurrent(il)) {
+            return n_embd_head_k_dsa;
+        }
         return is_swa(il) ? n_embd_head_k_swa : n_embd_head_k_full;
     }
 

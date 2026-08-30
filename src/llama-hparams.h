@@ -216,6 +216,10 @@ struct llama_hparams {
     // bit-identical while the sparse path is built and gated.
     bool     dsa_enabled       = false;
 
+    // Widened K-row width for DSA layers when dsa_enabled: kv_lora + indexer key + gate.
+    // Zero when DSA is off, which is the shipped configuration.
+    uint32_t n_embd_head_k_dsa = 0;
+
     // mHC hyper-connections (GLM-5.3-Flash). hc_mult residual streams per layer, mixed by a
     // Sinkhorn-normalised matrix. Note the normalisation is COLUMN-stochastic, not doubly
     // stochastic - it column-normalises once and then runs (iters-1) full row+column passes.
