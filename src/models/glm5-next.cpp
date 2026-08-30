@@ -86,6 +86,69 @@ static ggml_tensor * causal_conv1d(ggml_cgraph * gf, ggml_context * ctx0, ggml_t
 }
 
 
+// DSA index scores for the current batch.
+//
+// Validated formulation - tests/test-dsa-indexer.cpp checks exactly this against the
+// transformers oracle at 2.18e-06. Four things here are easy to get wrong and invisible if you
+// do (see scripts/dsa_reference.py):
+//   * k_norm is a LAYERNORM with a bias, not RMS.
+//   * The pool key is a PER-CHANNEL softmax over the kpool tokens of (gate + ape) - not a mean.
+//   * relu sits between the per-head scores and the head-weighted sum.
+//   * Pools start at the first real token; with no left padding that is slot 0.
+//
+// LIMITATION: this scores only the CURRENT batch, which is the prefill case. Decode needs the
+// indexer key and gate of every cached token, which means widening the KV row on this layer -
+// Phase 2b. Until then the scores are computed and discarded, so nothing consumes them.
+ggml_tensor * llm_build_glm5_next::build_dsa_index_scores(
+        ggml_tensor * x, ggml_tensor * q_a, const llama_layer & layer, int il) {
+    const int64_t hd = hparams.indexer_head_size;
+    const int64_t nh = hparams.indexer_n_head;
+    const int64_t kp = hparams.indexer_kpool ? hparams.indexer_kpool : 4;
+    const int64_t S  = x->ne[1];
+
+    ggml_tensor * q = ggml_mul_mat(ctx0, layer.indexer_attn_q_b, q_a);
+    q = ggml_reshape_3d(ctx0, q, hd, nh, S);
+
+    ggml_tensor * k = ggml_mul_mat(ctx0, layer.indexer_attn_k, x);
+    k = ggml_norm(ctx0, k, 1e-6f);                       // LayerNorm, eps 1e-6
+    k = ggml_add(ctx0, ggml_mul(ctx0, k, layer.indexer_k_norm), layer.indexer_k_norm_b);
+
+    ggml_tensor * gate = ggml_mul_mat(ctx0, layer.indexer_kpool_gate, x);
+
+    const int64_t n_pools = (S + kp - 1)/kp;
+    if (n_pools*kp != S) {
+        // Ragged tail: the reference pads the final pool and masks the missing slots. Not yet
+        // handled here, and silently mis-pooling would be worse than not running.
+        return nullptr;
+    }
+
+    ggml_tensor * k3   = ggml_reshape_3d(ctx0, k,    hd, kp, n_pools);
+    ggml_tensor * g3   = ggml_reshape_3d(ctx0, gate, hd, kp, n_pools);
+    ggml_tensor * ape3 = ggml_reshape_3d(ctx0, layer.indexer_kpool_ape, hd, kp, 1);
+
+    // soft_max reduces ne0, so bring kp there and put it back.
+    ggml_tensor * lg = ggml_add(ctx0, g3, ape3);
+    lg = ggml_cont(ctx0, ggml_permute(ctx0, lg, 1, 0, 2, 3));
+    lg = ggml_soft_max(ctx0, lg);
+    lg = ggml_cont(ctx0, ggml_permute(ctx0, lg, 1, 0, 2, 3));
+
+    ggml_tensor * pk = ggml_mul(ctx0, lg, k3);
+    pk = ggml_cont(ctx0, ggml_permute(ctx0, pk, 1, 0, 2, 3));
+    pk = ggml_sum_rows(ctx0, pk);
+    pk = ggml_reshape_2d(ctx0, pk, hd, n_pools);
+
+    ggml_tensor * sc = ggml_mul_mat(ctx0, pk, q);
+    sc = ggml_scale(ctx0, sc, 1.0f/sqrtf((float) hd));
+    sc = ggml_relu(ctx0, sc);                            // load-bearing
+
+    ggml_tensor * wgt = ggml_mul_mat(ctx0, layer.indexer_proj, x);
+    wgt = ggml_scale(ctx0, wgt, 1.0f/sqrtf((float) nh));
+    ggml_tensor * wgt3 = ggml_reshape_3d(ctx0, wgt, nh, 1, S);
+    ggml_tensor * scp  = ggml_cont(ctx0, ggml_permute(ctx0, sc, 1, 0, 2, 3));
+    ggml_tensor * idx  = ggml_mul_mat(ctx0, scp, wgt3);
+    return ggml_reshape_2d(ctx0, idx, n_pools, S);
+}
+
 llm_build_glm5_next::mhc_site llm_build_glm5_next::build_mhc(
         ggml_tensor * streams, ggml_tensor * fn, ggml_tensor * base,
         ggml_tensor * scale, int il) {
@@ -319,6 +382,21 @@ llm_build_glm5_next::llm_build_glm5_next(const llama_model & model, const llm_gr
             ggml_tensor * q_a = ggml_mul_mat(ctx0, layer.wq_a, cur);
             q_a = build_norm(q_a, layer.attn_q_a_norm, NULL, LLM_NORM_RMS, il);
             ggml_tensor * Qcur = ggml_mul_mat(ctx0, layer.wq_b, q_a);
+
+            // DSA indexer. Formulation validated against transformers in
+            // tests/test-dsa-indexer.cpp (rel error 2.18e-06); see research/DSA_LLAMACPP.md.
+            //
+            // Gated OFF by default: consuming these scores means widening the KV row on this
+            // layer to carry the indexer key, gate and valid flag, and the shipped GGUFs were
+            // validated with these layers dense. Built here so the graph-side formulation lives
+            // with the model rather than only in a test.
+            if (hparams.dsa_enabled && layer.indexer_attn_k && layer.indexer_kpool_gate) {
+                ggml_tensor * iscores = build_dsa_index_scores(cur, q_a, layer, il);
+                if (iscores) {
+                    cb(iscores, "dsa_index_scores", il);
+                    ggml_build_forward_expand(gf, iscores);
+                }
+            }
 
             ggml_tensor * kv_cmpr = ggml_mul_mat(ctx0, layer.wkv_a_mqa, cur);
             kv_cmpr = build_norm(kv_cmpr, layer.attn_kv_a_norm, NULL, LLM_NORM_RMS, il);

@@ -379,6 +379,10 @@ struct llm_build_glm5_next : public llm_build_delta_net_base {
     // streams' = post (x) y + comb^T @ streams
     ggml_tensor * apply_mhc(const mhc_site & s, ggml_tensor * y, int il);
 
+    // DSA index scores for the current batch (prefill). Validated in test-dsa-indexer.cpp.
+    ggml_tensor * build_dsa_index_scores(ggml_tensor * x, ggml_tensor * q_a,
+                                         const llama_layer & layer, int il);
+
     const llama_model & model;
 };
 
