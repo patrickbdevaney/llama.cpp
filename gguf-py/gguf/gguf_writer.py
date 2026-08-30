@@ -787,6 +787,9 @@ class GGUFWriter:
     def add_indexer_key_length(self, length: int) -> None:
         self.add_uint32(Keys.Attention.Indexer.KEY_LENGTH.format(arch=self.arch), length)
 
+    def add_indexer_kpool(self, value: int) -> None:
+        self.add_uint32(Keys.Attention.Indexer.KPOOL.format(arch=self.arch), value)
+
     def add_indexer_top_k(self, top_k: int) -> None:
         self.add_uint32(Keys.Attention.Indexer.TOP_K.format(arch=self.arch), top_k)
 

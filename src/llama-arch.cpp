@@ -245,6 +245,7 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
     { LLM_KV_ATTENTION_HC_MULT,                      "%s.attention.hc.mult"                      },
     { LLM_KV_ATTENTION_HC_SINKHORN_ITERS,            "%s.attention.hc.sinkhorn_iters"            },
     { LLM_KV_ATTENTION_HC_EPS,                       "%s.attention.hc.eps"                       },
+    { LLM_KV_ATTENTION_INDEXER_KPOOL,                "%s.attention.indexer.kpool"                },
     { LLM_KV_ATTENTION_INDEXER_TOP_K,                "%s.attention.indexer.top_k"                },
     { LLM_KV_ATTENTION_SHARED_KV_LAYERS,             "%s.attention.shared_kv_layers"             },
 

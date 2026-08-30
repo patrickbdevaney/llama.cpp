@@ -2565,6 +2565,13 @@ void llama_model::load_hparams(llama_model_loader & ml) {
                 ml.get_key(LLM_KV_ATTENTION_INDEXER_HEAD_COUNT, hparams.indexer_n_head, false);
                 ml.get_key(LLM_KV_ATTENTION_INDEXER_KEY_LENGTH, hparams.indexer_head_size, false);
                 ml.get_key(LLM_KV_ATTENTION_INDEXER_TOP_K,      hparams.indexer_top_k, false);
+                ml.get_key(LLM_KV_ATTENTION_INDEXER_KPOOL,      hparams.indexer_kpool, false);
+                // Opt-in via GLM5_DSA=1 until the sparse path is gated at ctx <= index_topk
+                // (where selection is a no-op and must match dense exactly) and by NIAH above it.
+                {
+                    const char * e = getenv("GLM5_DSA");
+                    hparams.dsa_enabled = e && *e && *e != '0';
+                }
 
                 // mHC
                 ml.get_key(LLM_KV_ATTENTION_HC_MULT,            hparams.hc_mult);

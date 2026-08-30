@@ -6190,6 +6190,7 @@ class Glm5NextModel(TextModel):
         self.gguf_writer.add_indexer_head_count(self.hparams["index_n_heads"])
         self.gguf_writer.add_indexer_key_length(self.hparams["index_head_dim"])
         self.gguf_writer.add_indexer_top_k(self.hparams["index_topk"])
+        self.gguf_writer.add_indexer_kpool(self.hparams["index_kpool"])
 
         # --- mHC ---
         self.gguf_writer.add_hc_mult(self.hparams["hc_mult"])

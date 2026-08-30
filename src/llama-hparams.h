@@ -205,6 +205,16 @@ struct llama_hparams {
     uint32_t indexer_n_head    = 0;
     uint32_t indexer_head_size = 0;
     uint32_t indexer_top_k     = 0;
+    uint32_t indexer_kpool     = 0;
+
+    // DSA is OPT-IN and defaults OFF.
+    //
+    // The shipped GGUFs were validated with these layers running dense, which is also what
+    // upstream does for LLM_ARCH_GLM_DSA and DEEPSEEK2. Enabling sparse selection changes the
+    // KV cache row width on those layers (kv_lora + indexer key + gate + valid), so a bug here
+    // breaks a path that currently works. Default-off keeps the published artifacts' behaviour
+    // bit-identical while the sparse path is built and gated.
+    bool     dsa_enabled       = false;
 
     // mHC hyper-connections (GLM-5.3-Flash). hc_mult residual streams per layer, mixed by a
     // Sinkhorn-normalised matrix. Note the normalisation is COLUMN-stochastic, not doubly
