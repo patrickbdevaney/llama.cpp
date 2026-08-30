@@ -194,6 +194,7 @@ class Keys:
             HEAD_COUNT = "{arch}.attention.indexer.head_count"
             KEY_LENGTH = "{arch}.attention.indexer.key_length"
             TOP_K      = "{arch}.attention.indexer.top_k"
+            KPOOL      = "{arch}.attention.indexer.kpool"
 
     class Rope:
         DIMENSION_COUNT           = "{arch}.rope.dimension_count"
