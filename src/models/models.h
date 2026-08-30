@@ -359,6 +359,29 @@ struct llm_build_jamba : public llm_build_mamba_base {
     llm_build_jamba(const llama_model & model, const llm_graph_params & params);
 };
 
+// GLM-5.3-Flash. Structurally Kimi-Linear (KDA + NoPE MLA + sigmoid-router MoE) with mHC
+// hyper-connections replacing the plain residual: hc_mult parallel streams, mixed at each of
+// the two sites per layer by a Sinkhorn-normalised matrix.
+struct llm_build_glm5_next : public llm_build_delta_net_base {
+    llm_build_glm5_next(const llama_model & model, const llm_graph_params & params);
+
+    // One mHC site. `streams` is [n_embd, hc, n_tokens].
+    struct mhc_site {
+        ggml_tensor * post;      // [hc, n_tokens]        scales the sublayer output, range [0,2]
+        ggml_tensor * comb;      // [hc, hc, n_tokens]    column-stochastic mixing matrix
+        ggml_tensor * collapsed; // [n_embd, n_tokens]    input to the sublayer
+        ggml_tensor * streams_p; // [hc, n_embd, n_tokens] permuted streams, reused by the update
+    };
+
+    mhc_site build_mhc(ggml_tensor * streams, ggml_tensor * fn, ggml_tensor * base,
+                       ggml_tensor * scale, int il);
+
+    // streams' = post (x) y + comb^T @ streams
+    ggml_tensor * apply_mhc(const mhc_site & s, ggml_tensor * y, int il);
+
+    const llama_model & model;
+};
+
 struct llm_build_kimi_linear : public llm_build_delta_net_base {
     llm_build_kimi_linear(const llama_model & model, const llm_graph_params & params);
 

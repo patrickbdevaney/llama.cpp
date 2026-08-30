@@ -42,6 +42,7 @@ enum llm_ffn_op_type {
     LLM_FFN_GEGLU,
     LLM_FFN_REGLU,
     LLM_FFN_SWIGLU_OAI_MOE,
+    LLM_FFN_SWIGLU_CLAMPED,   // GLM-5.3: clamp then SiLU, no +1 on up
 };
 
 enum llm_ffn_gate_type {

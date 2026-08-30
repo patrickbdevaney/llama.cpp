@@ -4049,6 +4049,96 @@ void ggml_compute_forward_group_norm(
     }
 }
 
+// ggml_compute_forward_mhc_sinkhorn
+
+static void ggml_compute_forward_mhc_sinkhorn_f32(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+
+    const ggml_tensor * src0 = dst->src[0];
+
+    GGML_ASSERT(ggml_are_same_shape(src0, dst));
+    GGML_ASSERT(src0->nb[0] == sizeof(float));
+    GGML_ASSERT(src0->ne[0] == src0->ne[1]);
+
+    int   iters;
+    float eps;
+    memcpy(&iters, (const int32_t *) dst->op_params + 0, sizeof(int));
+    memcpy(&eps,   (const float   *) dst->op_params + 1, sizeof(float));
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int64_t hc = src0->ne[0];
+    // One [hc, hc] matrix per (token, batch) slice. hc is 4 for GLM-5.3, so the whole thing
+    // is 16 floats and stays in cache; the work is the 2*iters reductions, not the data.
+    const int64_t nr = ggml_nrows(src0) / hc;
+
+    const int64_t dr = (nr + nth - 1) / nth;
+    const int64_t i0 = dr * ith;
+    const int64_t i1 = MIN(i0 + dr, nr);
+
+    for (int64_t i = i0; i < i1; ++i) {
+        // i indexes the (ne2, ne3) slice grid; ne0 and ne1 are the matrix itself.
+        const int64_t i3 = i / src0->ne[2];
+        const int64_t i2 = i % src0->ne[2];
+
+        const char * src = (const char *) src0->data + i2*src0->nb[2] + i3*src0->nb[3];
+              char * out = (      char *) dst->data  + i2*dst->nb[2]  + i3*dst->nb[3];
+
+        // softmax over ne0 (the last torch dim), then + eps.
+        for (int64_t r = 0; r < hc; ++r) {
+            const float * s = (const float *)(src + r*src0->nb[1]);
+            float * o = (float *)(out + r*dst->nb[1]);
+            float mx = -INFINITY;
+            for (int64_t c = 0; c < hc; ++c) mx = MAX(mx, s[c]);
+            float sum = 0.0f;
+            for (int64_t c = 0; c < hc; ++c) { const float e = expf(s[c] - mx); o[c] = e; sum += e; }
+            const float inv = 1.0f / sum;
+            for (int64_t c = 0; c < hc; ++c) o[c] = o[c]*inv + eps;
+        }
+
+        // COLUMN normalisation first, then (iters-1) full (row, column) passes. This is the
+        // order the reference implements and it is not symmetric Sinkhorn - see ggml.h.
+        for (int64_t c = 0; c < hc; ++c) {
+            float sum = 0.0f;
+            for (int64_t r = 0; r < hc; ++r) sum += ((const float *)(out + r*dst->nb[1]))[c];
+            const float inv = 1.0f / (sum + eps);
+            for (int64_t r = 0; r < hc; ++r) ((float *)(out + r*dst->nb[1]))[c] *= inv;
+        }
+        for (int it = 1; it < iters; ++it) {
+            for (int64_t r = 0; r < hc; ++r) {
+                float * o = (float *)(out + r*dst->nb[1]);
+                float sum = 0.0f;
+                for (int64_t c = 0; c < hc; ++c) sum += o[c];
+                const float inv = 1.0f / (sum + eps);
+                for (int64_t c = 0; c < hc; ++c) o[c] *= inv;
+            }
+            for (int64_t c = 0; c < hc; ++c) {
+                float sum = 0.0f;
+                for (int64_t r = 0; r < hc; ++r) sum += ((const float *)(out + r*dst->nb[1]))[c];
+                const float inv = 1.0f / (sum + eps);
+                for (int64_t r = 0; r < hc; ++r) ((float *)(out + r*dst->nb[1]))[c] *= inv;
+            }
+        }
+    }
+}
+
+void ggml_compute_forward_mhc_sinkhorn(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    switch (dst->src[0]->type) {
+        case GGML_TYPE_F32:
+            {
+                ggml_compute_forward_mhc_sinkhorn_f32(params, dst);
+            } break;
+        default:
+            {
+                GGML_ABORT("fatal error");
+            }
+    }
+}
+
 // ggml_compute_forward_l2_norm
 
 static void ggml_compute_forward_l2_norm_f32(

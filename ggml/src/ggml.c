@@ -980,6 +980,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "RMS_NORM_BACK",
     "GROUP_NORM",
     "L2_NORM",
+    "MHC_SINKHORN",
 
     "MUL_MAT",
     "MUL_MAT_ID",
@@ -1057,7 +1058,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 96, "GGML_OP_COUNT != 96");
+static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT != 97");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1090,6 +1091,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "rms_norm_back(x)",
     "group_norm(x)",
     "l2_norm(x)",
+    "mhc_sinkhorn(x)",
 
     "X*Y",
     "X[i]*Y",
@@ -1167,7 +1169,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 96, "GGML_OP_COUNT != 96");
+static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT != 97");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -3170,6 +3172,27 @@ struct ggml_tensor * ggml_group_norm_inplace(
         int                   n_groups,
         float                 eps) {
     return ggml_group_norm_impl(ctx, a, n_groups, eps, true);
+}
+
+// ggml_mhc_sinkhorn
+
+struct ggml_tensor * ggml_mhc_sinkhorn(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        int                   iters,
+        float                 eps) {
+    GGML_ASSERT(a->ne[0] == a->ne[1]);   // square [hc, hc] slices
+    GGML_ASSERT(iters >= 1);
+
+    struct ggml_tensor * result = ggml_dup_tensor(ctx, a);
+
+    ggml_set_op_params_i32(result, 0, iters);
+    ggml_set_op_params_f32(result, 1, eps);
+
+    result->op     = GGML_OP_MHC_SINKHORN;
+    result->src[0] = a;
+
+    return result;
 }
 
 // ggml_l2_norm

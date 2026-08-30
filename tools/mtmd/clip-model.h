@@ -75,6 +75,11 @@ struct clip_hparams {
 
     ffn_op_type ffn_op = FFN_GELU;
 
+    // GLM-5.3 clamps SwiGLU in the VISION tower too: clamp(gate, max=L), clamp(up, -L, L),
+    // then SiLU. 0 means unclamped, which is every other model. The clamp only bites once
+    // activations exceed L - so it passes a small test and diverges on a real image.
+    float swiglu_limit = 0.0f;
+
     patch_merge_type mm_patch_merge_type = PATCH_MERGE_FLAT;
 
     float eps = 1e-6;

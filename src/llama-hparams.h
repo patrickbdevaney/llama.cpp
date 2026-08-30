@@ -206,6 +206,18 @@ struct llama_hparams {
     uint32_t indexer_head_size = 0;
     uint32_t indexer_top_k     = 0;
 
+    // mHC hyper-connections (GLM-5.3-Flash). hc_mult residual streams per layer, mixed by a
+    // Sinkhorn-normalised matrix. Note the normalisation is COLUMN-stochastic, not doubly
+    // stochastic - it column-normalises once and then runs (iters-1) full row+column passes.
+    // GLM-5.3 KDA forget gate: g = bound * sigmoid(exp(A_log) * (w + dt_bias)).
+    float    ssm_gate_lower_bound = 0.0f;
+    // Clamped SwiGLU (GLM-5.3): clamp(gate, max=L) and clamp(up, -L, L) BEFORE SiLU.
+    float    swiglu_limit         = 0.0f;
+
+    uint32_t hc_mult           = 0;
+    uint32_t hc_sinkhorn_iters = 0;
+    float    hc_eps            = 0.0f;
+
     // qwen3vl deepstack
     uint32_t n_deepstack_layers = 0;
 

@@ -4949,6 +4949,28 @@ class Glm4VVisionModel(Qwen3VLVisionModel):
         yield from super().modify_tensors(data_torch, name, bid)
 
 
+@ModelBase.register("Glm5NextForConditionalGeneration")
+class Glm5NextVisionModel(Glm4VVisionModel):
+    """GLM-5.3-Flash vision tower.
+
+    Structurally the GLM-4V tower - patch_embed / 24 blocks with qkv + q_norm/k_norm / a
+    downsample conv / a merger with gate+up+down and post_projection_norm - so the existing
+    PROJECTOR_TYPE_GLM4V graph and tensor mapping apply unchanged.
+
+    The one delta that matters is the MLP: GLM-5.3 clamps SwiGLU at `swiglu_limit` in the vision
+    tower as well as the text stack. That is recorded in the mmproj so the graph can honour it;
+    it only bites once activations exceed the limit, which is exactly the regime a small test
+    never reaches and a real image does.
+    """
+
+    def set_gguf_parameters(self):
+        super().set_gguf_parameters()
+        assert self.hparams_vision is not None
+        limit = self.hparams_vision.get("swiglu_limit")
+        if limit is not None:
+            self.gguf_writer.add_vision_swiglu_limit(float(limit))
+
+
 @ModelBase.register("Qwen3VLForConditionalGeneration")
 class Qwen3VLTextModel(Qwen3Model):
     model_arch = gguf.MODEL_ARCH.QWEN3VL
@@ -5961,7 +5983,16 @@ class KimiLinearModel(TextModel):
         # num_shared_experts (1 for Kimi)
         self.gguf_writer.add_expert_shared_count(self.hparams["num_shared_experts"])
         # first_k_dense_replace (1 for Kimi - first layer uses dense MLP)
-        self.gguf_writer.add_leading_dense_block_count(self.hparams["first_k_dense_replace"])
+        # `first_k_dense_replace` is NOT what decides this. transformers derives the FFN layout
+        # as `["dense"] * min(3, n_layer) + ["sparse"] * rest`, so trust mlp_layer_types when the
+        # config carries it and fall back only when it does not. (They agree at 3 for the real
+        # checkpoint; they disagree for any config where someone set the knob expecting it to.)
+        mlp_types = self.hparams.get("mlp_layer_types")
+        if mlp_types:
+            n_dense = next((i for i, t in enumerate(mlp_types) if t != "dense"), len(mlp_types))
+        else:
+            n_dense = self.hparams["first_k_dense_replace"]
+        self.gguf_writer.add_leading_dense_block_count(n_dense)
         # Routed scaling factor (expert_weights_scale = 2.446 for Kimi)
         self.gguf_writer.add_expert_weights_scale(self.hparams["routed_scaling_factor"])
 
@@ -6047,6 +6078,188 @@ class KimiLinearModel(TextModel):
             k_b = k_b.transpose(1, 2)
             yield from super().modify_tensors(k_b, name_kb, bid)
             yield from super().modify_tensors(v_b, name_vb, bid)
+            return
+
+        yield from super().modify_tensors(data_torch, name, bid)
+
+
+@ModelBase.register("Glm5NextForConditionalGeneration", "Glm5NextForCausalLM", "Glm5NextTextModel")
+class Glm5NextModel(TextModel):
+    """GLM-5.3-Flash: hybrid KDA + MLA/DSA MoE with mHC hyper-connections.
+
+    Closest existing relative is Kimi-Linear (same KDA delta rule, same MLA), with three
+    additions this converter has to carry:
+
+      * mHC hyper-connections - four residual streams per layer with Sinkhorn-normalised
+        mixing. Six tensors per layer, passed through unchanged; the graph does the work.
+      * MLA with NO rope at all (`mla_use_nope`, `qk_rope_head_dim == 0`). Kimi and DeepSeek
+        both rope the MLA path, so the usual `add_rope_dimension_count` path is wrong here.
+      * A natively multimodal checkpoint, so the text stack lives under
+        `model.language_model.` and the ViT under `model.visual.` (skipped - it belongs in
+        an mmproj file, not here).
+
+    Layer types come from `linear_attn_config`, and note they are ZERO-indexed here where
+    Kimi's are one-indexed. Getting that wrong silently builds a model with 34 attention
+    layers wired as recurrent ones, which loads fine and produces noise.
+    """
+    model_arch = gguf.MODEL_ARCH.GLM5_NEXT
+
+    _experts: list[dict[str, Tensor]] | None = None
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # The MTP block is a real 46th layer in the checkpoint (a full MoE layer, 3.81B
+        # params), so it has to be counted or its tensors have nowhere to go.
+        self.block_count = self.hparams["num_hidden_layers"] + self.hparams.get("num_nextn_predict_layers", 0)
+        self.tensor_map = gguf.get_tensor_name_map(self.model_arch, self.block_count)
+        self._keep_mtp = bool(os.environ.get("GLM5_KEEP_MTP", "1") not in ("0", "false", "no"))
+        if not self._keep_mtp:
+            logger.info("GLM5_KEEP_MTP=0: dropping the MTP block (~2.0 GiB at Q4_K_M); "
+                        "llama.cpp cannot execute it today")
+
+    def set_vocab(self):
+        self._set_vocab_gpt2()
+
+    def set_gguf_parameters(self):
+        super().set_gguf_parameters()
+        self.gguf_writer.add_vocab_size(self.hparams["vocab_size"])
+
+        lac = self.hparams["linear_attn_config"]
+        full_attn = set(lac["full_attn_layers"])          # ZERO-indexed, unlike Kimi's
+        n_layer = self.hparams["num_hidden_layers"]
+        nextn = self.hparams.get("num_nextn_predict_layers", 0)
+
+        # n_head_kv == 0 marks a recurrent (KDA) layer; > 0 marks full attention. The MTP
+        # block shares the DSA layout, so it is tagged as attention.
+        #
+        # The value for attention layers is 1, not num_key_value_heads: MLA stores ONE
+        # compressed latent per token, so the KV cache is MQA. Writing the real head count
+        # makes llama.cpp size the cache rows at n_head_kv * head_dim and ggml_set_rows then
+        # asserts against a kv_lora_rank-wide key. Kimi-Linear's converter does the same.
+        n_kv = [1 if (il in full_attn or il >= n_layer) else 0
+                for il in range(n_layer + nextn)]
+        assert sum(1 for x in n_kv[:n_layer] if x) == len(full_attn), \
+            f"layer-type map disagrees with linear_attn_config ({sum(1 for x in n_kv[:n_layer] if x)} vs {len(full_attn)})"
+        self.gguf_writer.add_head_count_kv(n_kv)
+
+        # --- KDA ---
+        self.gguf_writer.add_ssm_conv_kernel(lac["short_conv_kernel_size"])
+        self.gguf_writer.add_kda_head_dim(lac["head_dim"])
+        # GLM-5.3's forget gate is NOT Kimi's. Kimi: g = -exp(A_log) * softplus(w + dt_bias).
+        # GLM-5.3: g = lower_bound * sigmoid(exp(A_log) * (w + dt_bias)) - a bounded gate, with
+        # exp(A_log) POSITIVE and used inside the sigmoid. Copying Kimi's `-exp` here produces a
+        # model whose error grows monotonically along the sequence, which is exactly what it did.
+        self.gguf_writer.add_ssm_gate_lower_bound(float(lac["gate_lower_bound"]))
+
+        # --- MLA. NoPE: qk_rope_head_dim is 0 and mla_use_nope is set, so there is no
+        # rotary section at all and key length is just the compressed KV rank. ---
+        qk_rope = self.hparams.get("qk_rope_head_dim", 0)
+        assert qk_rope == 0 and self.hparams.get("mla_use_nope", False), \
+            "this converter assumes GLM-5.3's NoPE MLA; a roped variant needs the rope path back"
+        self.gguf_writer.add_rope_dimension_count(0)
+        kv_lora = self.hparams["kv_lora_rank"]
+        self.gguf_writer.add_q_lora_rank(self.hparams["q_lora_rank"])
+        self.gguf_writer.add_kv_lora_rank(kv_lora)
+        self.gguf_writer.add_key_length(kv_lora)
+        self.gguf_writer.add_key_length_mla(self.hparams["qk_nope_head_dim"])
+        self.gguf_writer.add_value_length_mla(self.hparams["v_head_dim"])
+
+        # --- MoE ---
+        self.gguf_writer.add_expert_count(self.hparams["n_routed_experts"])
+        self.gguf_writer.add_expert_used_count(self.hparams["num_experts_per_tok"])
+        self.gguf_writer.add_expert_feed_forward_length(self.hparams["moe_intermediate_size"])
+        self.gguf_writer.add_expert_shared_count(self.hparams["n_shared_experts"])
+        self.gguf_writer.add_leading_dense_block_count(self.hparams["first_k_dense_replace"])
+        self.gguf_writer.add_expert_weights_scale(self.hparams["routed_scaling_factor"])
+        self.gguf_writer.add_expert_weights_norm(self.hparams["norm_topk_prob"])
+        self.gguf_writer.add_expert_gating_func(gguf.ExpertGatingFuncType.SIGMOID)
+        # Clamped SwiGLU: gate is clamped ABOVE at the limit, up is clamped to +/-limit, and
+        # only then does SiLU apply. Plain SILU is right until activations reach the limit, at
+        # which point it silently diverges - so it must travel with the file.
+        self.gguf_writer.add_swiglu_limit(float(self.hparams["swiglu_limit"]))
+
+        # --- DSA indexer. Loaded for completeness; llama.cpp runs these layers dense, the
+        # same way it already does for LLM_ARCH_GLM_DSA. ---
+        self.gguf_writer.add_indexer_head_count(self.hparams["index_n_heads"])
+        self.gguf_writer.add_indexer_key_length(self.hparams["index_head_dim"])
+        self.gguf_writer.add_indexer_top_k(self.hparams["index_topk"])
+
+        # --- mHC ---
+        self.gguf_writer.add_hc_mult(self.hparams["hc_mult"])
+        self.gguf_writer.add_hc_sinkhorn_iters(self.hparams["hc_sinkhorn_iters"])
+        self.gguf_writer.add_hc_eps(self.hparams["hc_eps"])
+
+        if nextn:
+            self.gguf_writer.add_nextn_predict_layers(nextn)
+
+    def prepare_tensors(self):
+        super().prepare_tensors()
+        if self._experts is not None:
+            left = [k for d in self._experts for k in d]
+            if left:
+                raise ValueError(f"Unprocessed experts: {left[:5]} ({len(left)} total)")
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        # The ViT belongs in an mmproj file built by Glm5NextVisionModel, not here.
+        if name.startswith("model.visual."):
+            return
+        if name.startswith("model.language_model."):
+            name = name.replace("model.language_model.", "model.", 1)
+
+        n_layer = self.hparams["num_hidden_layers"]
+        if not self._keep_mtp and bid is not None and bid >= n_layer:
+            return
+
+        # KDA conv1d: HF [d_inner, d_conv] -> ggml ne [d_conv, 1, d_inner, 1]. GGUF reverses
+        # the numpy shape on write, so the target numpy shape is (1, d_inner, 1, d_conv);
+        # d_conv stays fastest-varying in memory, which is what ggml_ssm_conv indexes.
+        if name.endswith((".q_conv1d.weight", ".k_conv1d.weight", ".v_conv1d.weight")):
+            if data_torch.ndim == 3:                 # [d_inner, 1, d_conv]
+                data_torch = data_torch.squeeze(1)
+            d_inner, d_conv = data_torch.shape
+            data_torch = data_torch.reshape(1, d_inner, 1, d_conv)
+
+        # Store exp(A_log) - a pure function of the weight, so precomputing it costs the graph
+        # nothing. NOT -exp: see the forget-gate note in set_gguf_parameters.
+        if name.endswith(".A_log"):
+            data_torch = torch.exp(data_torch)
+        if name.endswith(".dt_bias"):
+            name = name.rpartition(".dt_bias")[0] + ".dt_proj.bias"
+        if name.endswith("e_score_correction_bias"):
+            name = name.replace("e_score_correction_bias", "e_score_correction.bias")
+
+        # Routed experts are stacked into one 3D tensor per projection, which is what
+        # llama.cpp's fused MoE kernels index.
+        if ".mlp.experts." in name:
+            n_experts = self.hparams["n_routed_experts"]
+            assert bid is not None
+            if self._experts is None:
+                self._experts = [{} for _ in range(self.block_count)]
+            self._experts[bid][name] = data_torch
+            if len(self._experts[bid]) >= n_experts * 3:
+                for proj, tname in (("gate_proj", gguf.MODEL_TENSOR.FFN_GATE_EXP),
+                                    ("down_proj", gguf.MODEL_TENSOR.FFN_DOWN_EXP),
+                                    ("up_proj",   gguf.MODEL_TENSOR.FFN_UP_EXP)):
+                    datas: list[Tensor] = []
+                    for xid in range(n_experts):
+                        ename = f"model.layers.{bid}.mlp.experts.{xid}.{proj}.weight"
+                        datas.append(self._experts[bid][ename])
+                        del self._experts[bid][ename]
+                    stacked = torch.stack(datas, dim=0)
+                    yield from super().modify_tensors(stacked, self.format_tensor_name(tname, bid), bid)
+            return
+
+        # MLA absorption wants kv_b split, with k_b transposed.
+        if name.endswith("kv_b_proj.weight"):
+            n_head_kv = self.hparams["num_key_value_heads"]
+            v_head_dim = self.hparams["v_head_dim"]
+            qk_nope = self.hparams["qk_nope_head_dim"]
+            assert data_torch.shape[0] == n_head_kv * (v_head_dim + qk_nope), \
+                f"kv_b_proj {tuple(data_torch.shape)} does not match {n_head_kv}*({v_head_dim}+{qk_nope})"
+            kv_b = data_torch.view(n_head_kv, v_head_dim + qk_nope, data_torch.shape[-1])
+            k_b, v_b = torch.split(kv_b, [qk_nope, v_head_dim], dim=1)
+            yield from super().modify_tensors(k_b.transpose(1, 2), name.replace("kv_b_proj", "k_b_proj"), bid)
+            yield from super().modify_tensors(v_b, name.replace("kv_b_proj", "v_b_proj"), bid)
             return
 
         yield from super().modify_tensors(data_torch, name, bid)

@@ -499,6 +499,7 @@ extern "C" {
         GGML_OP_RMS_NORM_BACK,
         GGML_OP_GROUP_NORM,
         GGML_OP_L2_NORM,
+        GGML_OP_MHC_SINKHORN,
 
         GGML_OP_MUL_MAT,
         GGML_OP_MUL_MAT_ID,
@@ -1383,6 +1384,25 @@ extern "C" {
 
     // l2 normalize along rows
     // used in rwkv v7
+    // mHC (GLM-5.3-Flash hyper-connections): softmax over ne0, add eps, then a Sinkhorn
+    // projection of each [hc, hc] slice.
+    //
+    // Fused because the alternative is ~180 graph nodes per site for reductions over a 4x4
+    // matrix - 16k nodes and kernel launches per token across 45 layers x 2 sites. The whole
+    // thing fits in registers.
+    //
+    // The normalisation ORDER is load-bearing and is NOT symmetric Sinkhorn: column
+    // normalisation once, then (iters - 1) full (row, column) passes. The result is
+    // COLUMN-stochastic, not doubly stochastic. Reading it as `iters` symmetric passes still
+    // produces a plausible matrix and a subtly wrong model.
+    //
+    // a: [hc, hc, n_tokens, 1] pre-softmax logits. Returns the same shape.
+    GGML_API struct ggml_tensor * ggml_mhc_sinkhorn(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            int                   iters,
+            float                 eps);
+
     GGML_API struct ggml_tensor * ggml_l2_norm(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,

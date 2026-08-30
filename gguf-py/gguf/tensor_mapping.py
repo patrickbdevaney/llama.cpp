@@ -2086,6 +2086,16 @@ class TensorNameMap:
         ),
 
         # NextN/MTP tensors
+        MODEL_TENSOR.INDEXER_KPOOL_APE: (
+            "model.layers.{bid}.self_attn.indexer.index_kpool_compress_ape",
+            "model.language_model.layers.{bid}.self_attn.indexer.index_kpool_compress_ape",
+        ),
+
+        MODEL_TENSOR.INDEXER_KPOOL_GATE: (
+            "model.layers.{bid}.self_attn.indexer.index_kpool_compress_gate",
+            "model.language_model.layers.{bid}.self_attn.indexer.index_kpool_compress_gate",
+        ),
+
         MODEL_TENSOR.NEXTN_EH_PROJ: (
             "model.layers.{bid}.eh_proj",
         ),

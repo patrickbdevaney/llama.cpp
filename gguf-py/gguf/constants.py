@@ -122,6 +122,7 @@ class Keys:
         EXPERT_WEIGHTS_SCALE              = "{arch}.expert_weights_scale"
         EXPERT_WEIGHTS_NORM               = "{arch}.expert_weights_norm"
         EXPERT_GATING_FUNC                = "{arch}.expert_gating_func"
+        SWIGLU_LIMIT                      = "{arch}.swiglu_limit"
         EXPERT_GROUP_SCALE                = "{arch}.expert_group_scale"
         EXPERTS_PER_GROUP                 = "{arch}.experts_per_group"
         MOE_EVERY_N_LAYERS                = "{arch}.moe_every_n_layers"
@@ -222,6 +223,7 @@ class Keys:
         STATE_SIZE     = "{arch}.ssm.state_size"
         TIME_STEP_RANK = "{arch}.ssm.time_step_rank"
         GROUP_COUNT    = "{arch}.ssm.group_count"
+        GATE_LOWER_BOUND = "{arch}.ssm.gate_lower_bound"
         DT_B_C_RMS     = "{arch}.ssm.dt_b_c_rms"
 
     class KDA:
@@ -319,6 +321,7 @@ class Keys:
         SPATIAL_MERGE_SIZE  = "clip.vision.spatial_merge_size"
         USE_GELU            = "clip.use_gelu"
         USE_SILU            = "clip.use_silu"
+        SWIGLU_LIMIT        = "clip.vision.swiglu_limit"
         N_WA_PATTERN        = "clip.vision.n_wa_pattern" # used by qwen2.5vl
         WA_LAYER_INDEXES    = "clip.vision.wa_layer_indexes" # used by youtuvl
         IS_DEEPSTACK_LAYERS = "clip.vision.is_deepstack_layers"
@@ -711,6 +714,8 @@ class MODEL_TENSOR(IntEnum):
     INDEXER_PROJ         = auto()
     INDEXER_ATTN_K       = auto()
     INDEXER_ATTN_Q_B     = auto()
+    INDEXER_KPOOL_APE    = auto()
+    INDEXER_KPOOL_GATE   = auto()
     HC_ATTN_FN           = auto()
     HC_ATTN_BASE         = auto()
     HC_ATTN_SCALE        = auto()
@@ -1201,6 +1206,8 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.HC_FFN_BASE:               "blk.{bid}.hc_ffn_base",
     MODEL_TENSOR.HC_FFN_SCALE:              "blk.{bid}.hc_ffn_scale",
     MODEL_TENSOR.INDEXER_ATTN_Q_B:          "blk.{bid}.indexer.attn_q_b",
+    MODEL_TENSOR.INDEXER_KPOOL_APE:         "blk.{bid}.indexer.kpool_ape",
+    MODEL_TENSOR.INDEXER_KPOOL_GATE:        "blk.{bid}.indexer.kpool_gate",
     # vision
     MODEL_TENSOR.V_MMPROJ:                  "mm.{bid}",
     MODEL_TENSOR.V_MMPROJ_FC:               "mm.model.fc",
@@ -3928,6 +3935,15 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.HC_FFN_FN,
         MODEL_TENSOR.HC_FFN_BASE,
         MODEL_TENSOR.HC_FFN_SCALE,
+        MODEL_TENSOR.INDEXER_KPOOL_APE,
+        MODEL_TENSOR.INDEXER_KPOOL_GATE,
+        # The MTP block is a real layer in the checkpoint and its weights ship in the file.
+        # llama.cpp loads and then ignores them (see llama-model.cpp, "preserved but unused"),
+        # so this buys forward compatibility, not a working speculative decoder today.
+        MODEL_TENSOR.NEXTN_EH_PROJ,
+        MODEL_TENSOR.NEXTN_ENORM,
+        MODEL_TENSOR.NEXTN_HNORM,
+        MODEL_TENSOR.NEXTN_SHARED_HEAD_NORM,
     ],
     # TODO
 }

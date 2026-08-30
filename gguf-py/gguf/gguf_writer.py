@@ -790,6 +790,21 @@ class GGUFWriter:
     def add_indexer_top_k(self, top_k: int) -> None:
         self.add_uint32(Keys.Attention.Indexer.TOP_K.format(arch=self.arch), top_k)
 
+    def add_swiglu_limit(self, value: float) -> None:
+        self.add_float32(Keys.LLM.SWIGLU_LIMIT.format(arch=self.arch), value)
+
+    def add_ssm_gate_lower_bound(self, value: float) -> None:
+        self.add_float32(Keys.SSM.GATE_LOWER_BOUND.format(arch=self.arch), value)
+
+    def add_hc_mult(self, value: int) -> None:
+        self.add_uint32(Keys.Attention.HyperConnection.MULT.format(arch=self.arch), value)
+
+    def add_hc_sinkhorn_iters(self, value: int) -> None:
+        self.add_uint32(Keys.Attention.HyperConnection.SINKHORN_ITERS.format(arch=self.arch), value)
+
+    def add_hc_eps(self, value: float) -> None:
+        self.add_float32(Keys.Attention.HyperConnection.EPS.format(arch=self.arch), value)
+
     def add_max_alibi_bias(self, bias: float) -> None:
         self.add_float32(Keys.Attention.MAX_ALIBI_BIAS.format(arch=self.arch), bias)
 
@@ -1177,6 +1192,9 @@ class GGUFWriter:
 
     def add_vision_use_gelu(self, value: bool) -> None:
         self.add_bool(Keys.ClipVision.USE_GELU, value)
+
+    def add_vision_swiglu_limit(self, value: float) -> None:
+        self.add_float32(Keys.ClipVision.SWIGLU_LIMIT, value)
 
     def add_vision_use_silu(self, value: bool) -> None:
         self.add_bool(Keys.ClipVision.USE_SILU, value)

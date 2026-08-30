@@ -1527,6 +1527,17 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                 cur = ggml_swiglu_oai(ctx0, cur, up, alpha, limit);
                 cb(cur, "ffn_moe_swiglu_oai", il);
             } break;
+        case LLM_FFN_SWIGLU_CLAMPED:
+            {
+                // GLM-5.3. ggml_swiglu_oai clamps identically but computes
+                // silu_alpha(gate) * (up + 1); GLM has no +1 and alpha = 1, so do it explicitly
+                // rather than pass alpha=1 and inherit the bias.
+                const float limit = hparams.swiglu_limit;
+                cur = ggml_clamp(ctx0, cur, -INFINITY, limit);
+                up  = ggml_clamp(ctx0, up,  -limit,    limit);
+                cur = ggml_mul(ctx0, ggml_silu(ctx0, cur), up);
+                cb(cur, "ffn_moe_swiglu_clamped", il);
+            } break;
         case LLM_FFN_RELU:
             if (has_gate) {
                 cur = ggml_reglu_split(ctx0, cur, up);

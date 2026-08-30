@@ -580,7 +580,13 @@ ggml_tensor * clip_graph::build_ffn(
     // we only support parallel ffn for now
     switch (type_op) {
         case FFN_SILU:
-            if (gate) {
+            if (gate && hparams.swiglu_limit > 0.0f) {
+                const float lim = hparams.swiglu_limit;
+                cur = ggml_clamp(ctx0, cur, -INFINITY, lim);
+                tmp = ggml_clamp(ctx0, tmp, -lim,      lim);
+                cur = ggml_mul(ctx0, ggml_silu(ctx0, cur), tmp);
+                cb(cur, "ffn_swiglu_clamped", il);
+            } else if (gate) {
                 cur = ggml_swiglu_split(ctx0, cur, tmp);
                 cb(cur, "ffn_swiglu", il);
             } else {
@@ -1127,6 +1133,7 @@ struct clip_model_loader {
                     log_ffn_op = "gelu";
                 } else if (use_silu) {
                     hparams.ffn_op = FFN_SILU;
+                    get_f32(KEY_VISION_SWIGLU_LIMIT, hparams.swiglu_limit, false);
                     log_ffn_op = "silu";
                 } else {
                     hparams.ffn_op = FFN_GELU_QUICK;

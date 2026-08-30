@@ -2527,6 +2527,61 @@ void llama_model::load_hparams(llama_model_loader & ml) {
                     default: type = LLM_TYPE_UNKNOWN;
                 }
             } break;
+        case LLM_ARCH_GLM5_NEXT:
+            {
+                ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
+
+                // MLA. GLM-5.3 uses NoPE on the full-attention path: qk_rope_head_dim is 0 and
+                // the converter writes rope_dimension_count = 0, so there is no rotary section
+                // to carve out of the query. get_rope_type() returns NONE for this arch.
+                ml.get_key(LLM_KV_ATTENTION_KEY_LENGTH_MLA,    hparams.n_embd_head_k_mla_impl);
+                ml.get_key(LLM_KV_ATTENTION_VALUE_LENGTH_MLA,  hparams.n_embd_head_v_mla_impl);
+                ml.get_key(LLM_KV_ATTENTION_Q_LORA_RANK,       hparams.n_lora_q);
+                ml.get_key(LLM_KV_ATTENTION_KV_LORA_RANK,      hparams.n_lora_kv);
+
+                // KDA
+                ml.get_key(LLM_KV_SSM_CONV_KERNEL,             hparams.ssm_d_conv);
+                ml.get_key(LLM_KV_KDA_HEAD_DIM,                hparams.n_embd_head_kda);
+                ml.get_key(LLM_KV_SSM_GATE_LOWER_BOUND,        hparams.ssm_gate_lower_bound);
+                ml.get_key(LLM_KV_SWIGLU_LIMIT,                hparams.swiglu_limit, false);
+
+                // A layer is recurrent iff the converter wrote n_head_kv == 0 for it. The
+                // converter derives that from linear_attn_config.full_attn_layers, which is
+                // ZERO-indexed in GLM-5.3 (it is one-indexed in Kimi-Linear).
+                for (uint32_t i = 0; i < hparams.n_layer; ++i) {
+                    hparams.recurrent_layer_arr[i] = hparams.n_head_kv(i) == 0;
+                }
+
+                // MoE
+                ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,  hparams.n_ff_exp);
+                ml.get_key(LLM_KV_EXPERT_SHARED_COUNT,         hparams.n_expert_shared);
+                ml.get_key(LLM_KV_LEADING_DENSE_BLOCK_COUNT,   hparams.n_layer_dense_lead, false);
+                ml.get_key(LLM_KV_EXPERT_WEIGHTS_SCALE,        hparams.expert_weights_scale, false);
+                ml.get_key(LLM_KV_EXPERT_WEIGHTS_NORM,         hparams.expert_weights_norm, false);
+                ml.get_key(LLM_KV_EXPERT_GATING_FUNC,          hparams.expert_gating_func, false);
+
+                // DSA indexer: loaded for completeness, not executed. llama.cpp runs these
+                // layers as dense MLA, the same way LLM_ARCH_GLM_DSA already does.
+                ml.get_key(LLM_KV_ATTENTION_INDEXER_HEAD_COUNT, hparams.indexer_n_head, false);
+                ml.get_key(LLM_KV_ATTENTION_INDEXER_KEY_LENGTH, hparams.indexer_head_size, false);
+                ml.get_key(LLM_KV_ATTENTION_INDEXER_TOP_K,      hparams.indexer_top_k, false);
+
+                // mHC
+                ml.get_key(LLM_KV_ATTENTION_HC_MULT,            hparams.hc_mult);
+                ml.get_key(LLM_KV_ATTENTION_HC_SINKHORN_ITERS,  hparams.hc_sinkhorn_iters);
+                ml.get_key(LLM_KV_ATTENTION_HC_EPS,             hparams.hc_eps);
+
+                // The MTP block is a real layer in the file. Exclude it from the transformer
+                // stack and from the KV cache; its weights are loaded and never executed.
+                ml.get_key(LLM_KV_NEXTN_PREDICT_LAYERS, hparams.nextn_predict_layers, false);
+                GGML_ASSERT(hparams.nextn_predict_layers < hparams.n_layer);
+                hparams.n_layer_kv_from_start = hparams.n_layer - hparams.nextn_predict_layers;
+
+                switch (hparams.n_layer) {
+                    case 46: type = LLM_TYPE_A13B; break;  // GLM-5.3-Flash REAP-50
+                    default: type = LLM_TYPE_UNKNOWN;
+                }
+            } break;
         case LLM_ARCH_KIMI_LINEAR:
             {
                 ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
@@ -7077,6 +7132,127 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                         layer.ffn_exp_probs_b = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B, "bias", i), {n_expert}, 0);
                     }
                 } break;
+            case LLM_ARCH_GLM5_NEXT:
+                {
+                    tok_embd    = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD,  "weight"), {n_embd, n_vocab}, 0);
+                    output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd}, 0);
+                    output      = create_tensor(tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_vocab}, 0);
+
+                    const int64_t hc          = hparams.hc_mult;
+                    const int64_t n_hc_mix    = (2 + hc) * hc;     // pre | post | comb logits
+                    const int64_t kda_head    = hparams.n_embd_head_kda;
+                    const int64_t kda_inner   = kda_head * n_head;
+                    const int64_t ssm_d_conv  = hparams.ssm_d_conv;
+                    const int64_t n_ff_exp    = hparams.n_ff_exp;
+                    const int64_t n_mtp_start = n_layer - hparams.nextn_predict_layers;
+
+                    for (int i = 0; i < n_layer; ++i) {
+                        auto & layer = layers[i];
+
+                        layer.attn_norm = create_tensor(tn(LLM_TENSOR_ATTN_NORM, "weight", i), {n_embd}, 0);
+                        layer.ffn_norm  = create_tensor(tn(LLM_TENSOR_FFN_NORM,  "weight", i), {n_embd}, 0);
+
+                        // mHC is on the TRANSFORMER layers only. The MTP block has none: it
+                        // consumes the already-collapsed hidden state, so there are no parallel
+                        // streams left to mix. Creating them for layer 45 as required tensors is
+                        // what "missing tensor 'blk.45.hc_attn_fn'" was.
+                        if (i < (int) n_mtp_start) {
+                            layer.hc_attn_fn    = create_tensor(tn(LLM_TENSOR_HC_ATTN_FN, i), {hc*n_embd, n_hc_mix}, 0);
+                            layer.hc_attn_base  = create_tensor(tn(LLM_TENSOR_HC_ATTN_BASE, i), {n_hc_mix}, 0);
+                            layer.hc_attn_scale = create_tensor(tn(LLM_TENSOR_HC_ATTN_SCALE, i), {3}, 0);
+                            layer.hc_ffn_fn     = create_tensor(tn(LLM_TENSOR_HC_FFN_FN, i), {hc*n_embd, n_hc_mix}, 0);
+                            layer.hc_ffn_base   = create_tensor(tn(LLM_TENSOR_HC_FFN_BASE, i), {n_hc_mix}, 0);
+                            layer.hc_ffn_scale  = create_tensor(tn(LLM_TENSOR_HC_FFN_SCALE, i), {3}, 0);
+                        }
+
+                        if (hparams.is_recurrent(i)) {
+                            // KDA. Conv weights are written 4D; a quantised file may drop the
+                            // trailing 1, so accept 3D as well.
+                            layer.ssm_q_conv = create_tensor(tn(LLM_TENSOR_SSM_CONV1D_Q, "weight", i), {ssm_d_conv, 1, kda_inner, 1}, TENSOR_NOT_REQUIRED);
+                            if (!layer.ssm_q_conv) layer.ssm_q_conv = create_tensor(tn(LLM_TENSOR_SSM_CONV1D_Q, "weight", i), {ssm_d_conv, 1, kda_inner}, 0);
+                            layer.ssm_k_conv = create_tensor(tn(LLM_TENSOR_SSM_CONV1D_K, "weight", i), {ssm_d_conv, 1, kda_inner, 1}, TENSOR_NOT_REQUIRED);
+                            if (!layer.ssm_k_conv) layer.ssm_k_conv = create_tensor(tn(LLM_TENSOR_SSM_CONV1D_K, "weight", i), {ssm_d_conv, 1, kda_inner}, 0);
+                            layer.ssm_v_conv = create_tensor(tn(LLM_TENSOR_SSM_CONV1D_V, "weight", i), {ssm_d_conv, 1, kda_inner, 1}, TENSOR_NOT_REQUIRED);
+                            if (!layer.ssm_v_conv) layer.ssm_v_conv = create_tensor(tn(LLM_TENSOR_SSM_CONV1D_V, "weight", i), {ssm_d_conv, 1, kda_inner}, 0);
+
+                            layer.wq = create_tensor(tn(LLM_TENSOR_ATTN_Q, "weight", i), {n_embd, kda_inner}, 0);
+                            layer.wk = create_tensor(tn(LLM_TENSOR_ATTN_K, "weight", i), {n_embd, kda_inner}, 0);
+                            layer.wv = create_tensor(tn(LLM_TENSOR_ATTN_V, "weight", i), {n_embd, kda_inner}, 0);
+
+                            layer.ssm_f_a    = create_tensor(tn(LLM_TENSOR_SSM_F_A,  "weight", i), {n_embd,   kda_head},  0);
+                            layer.ssm_f_b    = create_tensor(tn(LLM_TENSOR_SSM_F_B,  "weight", i), {kda_head, kda_inner}, 0);
+                            layer.ssm_g_a    = create_tensor(tn(LLM_TENSOR_SSM_G_A,  "weight", i), {n_embd,   kda_head},  0);
+                            layer.ssm_g_b    = create_tensor(tn(LLM_TENSOR_SSM_G_B,  "weight", i), {kda_head, kda_inner}, 0);
+                            layer.ssm_beta   = create_tensor(tn(LLM_TENSOR_SSM_BETA, "weight", i), {n_embd,   n_head},    0);
+                            layer.ssm_dt_b   = create_tensor(tn(LLM_TENSOR_SSM_DT,   "bias",   i), {kda_inner},           0);
+                            layer.ssm_o_norm = create_tensor(tn(LLM_TENSOR_SSM_NORM, "weight", i), {kda_head},            0);
+
+                            // GLM-5.3 stores A_log as a bare [n_head] vector; Kimi-Linear's is
+                            // [1, n_head, 1, 1]. Accept either so one graph serves both.
+                            layer.ssm_a = create_tensor(tn(LLM_TENSOR_SSM_A, i), {n_head}, TENSOR_NOT_REQUIRED);
+                            if (!layer.ssm_a) layer.ssm_a = create_tensor(tn(LLM_TENSOR_SSM_A, i), {1, n_head, 1, 1}, TENSOR_NOT_REQUIRED);
+                            if (!layer.ssm_a) layer.ssm_a = create_tensor(tn(LLM_TENSOR_SSM_A, i), {1, n_head}, 0);
+
+                            layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i), {kda_inner, n_embd}, 0);
+                        } else {
+                            // MLA + DSA. NoPE: qk_rope_head_dim is 0, so kv_a carries only the
+                            // compressed KV rank and no rotary tail is split out of the query.
+                            const int64_t q_lora  = hparams.n_lora_q;
+                            const int64_t kv_lora = hparams.n_lora_kv;
+                            const int64_t hk      = hparams.n_embd_head_k_mla();
+                            const int64_t hv      = hparams.n_embd_head_v_mla();
+
+                            layer.attn_q_a_norm  = create_tensor(tn(LLM_TENSOR_ATTN_Q_A_NORM,  "weight", i), {q_lora},  0);
+                            layer.attn_kv_a_norm = create_tensor(tn(LLM_TENSOR_ATTN_KV_A_NORM, "weight", i), {kv_lora}, 0);
+                            layer.wq_a      = create_tensor(tn(LLM_TENSOR_ATTN_Q_A,      "weight", i), {n_embd, q_lora}, 0);
+                            layer.wq_b      = create_tensor(tn(LLM_TENSOR_ATTN_Q_B,      "weight", i), {q_lora, n_head * hk}, 0);
+                            layer.wkv_a_mqa = create_tensor(tn(LLM_TENSOR_ATTN_KV_A_MQA, "weight", i), {n_embd, kv_lora}, 0);
+
+                            layer.wkv_b = create_tensor(tn(LLM_TENSOR_ATTN_KV_B, "weight", i),
+                                    {kv_lora, n_head * (hk + hv)}, TENSOR_NOT_REQUIRED | TENSOR_SKIP_IF_VIRTUAL);
+                            if (!layer.wkv_b) {
+                                layer.wk_b = create_tensor(tn(LLM_TENSOR_ATTN_K_B, "weight", i), {hk, kv_lora, n_head}, 0);
+                                layer.wv_b = create_tensor(tn(LLM_TENSOR_ATTN_V_B, "weight", i), {kv_lora, hv, n_head}, 0);
+                            }
+                            layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i), {n_head * hv, n_embd}, 0);
+
+                            // DSA indexer: loaded so the file round-trips, never executed.
+                            const int64_t idx_h = hparams.indexer_head_size;
+                            layer.indexer_k_norm     = create_tensor(tn(LLM_TENSOR_INDEXER_K_NORM,     "weight", i), {idx_h}, TENSOR_NOT_REQUIRED);
+                            layer.indexer_k_norm_b   = create_tensor(tn(LLM_TENSOR_INDEXER_K_NORM,     "bias",   i), {idx_h}, TENSOR_NOT_REQUIRED);
+                            layer.indexer_proj       = create_tensor(tn(LLM_TENSOR_INDEXER_PROJ,       "weight", i), {n_embd, (int64_t) hparams.indexer_n_head}, TENSOR_NOT_REQUIRED);
+                            layer.indexer_attn_k     = create_tensor(tn(LLM_TENSOR_INDEXER_ATTN_K,     "weight", i), {n_embd, idx_h}, TENSOR_NOT_REQUIRED);
+                            layer.indexer_attn_q_b   = create_tensor(tn(LLM_TENSOR_INDEXER_ATTN_Q_B,   "weight", i), {q_lora, (int64_t) hparams.indexer_n_head * idx_h}, TENSOR_NOT_REQUIRED);
+                            layer.indexer_kpool_ape  = create_tensor(tn(LLM_TENSOR_INDEXER_KPOOL_APE, i), {idx_h, 4}, TENSOR_NOT_REQUIRED);
+                            layer.indexer_kpool_gate = create_tensor(tn(LLM_TENSOR_INDEXER_KPOOL_GATE, i), {n_embd, idx_h}, TENSOR_NOT_REQUIRED);
+                        }
+
+                        if (i < (int) hparams.n_layer_dense_lead) {
+                            layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", i), {n_embd, n_ff}, 0);
+                            layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", i), {n_ff, n_embd}, 0);
+                            layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd, n_ff}, 0);
+                        } else {
+                            layer.ffn_gate_inp    = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP,    "weight", i), {n_embd, n_expert}, 0);
+                            layer.ffn_exp_probs_b = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B, "bias",   i), {n_expert}, 0);
+                            layer.ffn_gate_exps   = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS,   "weight", i), {n_embd, n_ff_exp, n_expert}, 0);
+                            layer.ffn_down_exps   = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS,   "weight", i), {n_ff_exp, n_embd, n_expert}, 0);
+                            layer.ffn_up_exps     = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,     "weight", i), {n_embd, n_ff_exp, n_expert}, 0);
+
+                            const int64_t n_ff_shexp = n_ff_exp * (hparams.n_expert_shared > 0 ? hparams.n_expert_shared : 1);
+                            layer.ffn_gate_shexp = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP, "weight", i), {n_embd, n_ff_shexp}, 0);
+                            layer.ffn_down_shexp = create_tensor(tn(LLM_TENSOR_FFN_DOWN_SHEXP, "weight", i), {n_ff_shexp, n_embd}, 0);
+                            layer.ffn_up_shexp   = create_tensor(tn(LLM_TENSOR_FFN_UP_SHEXP,   "weight", i), {n_embd, n_ff_shexp}, 0);
+                        }
+
+                        // MTP block: loaded, never executed. See llm_arch notes.
+                        if (i >= (int) n_mtp_start) {
+                            layer.nextn.eh_proj          = create_tensor(tn(LLM_TENSOR_NEXTN_EH_PROJ,          "weight", i), {2*n_embd, n_embd}, 0);
+                            layer.nextn.enorm            = create_tensor(tn(LLM_TENSOR_NEXTN_ENORM,            "weight", i), {n_embd}, 0);
+                            layer.nextn.hnorm            = create_tensor(tn(LLM_TENSOR_NEXTN_HNORM,            "weight", i), {n_embd}, 0);
+                            layer.nextn.shared_head_norm = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_NORM, "weight", i), {n_embd}, TENSOR_NOT_REQUIRED);
+                        }
+                    }
+                } break;
             case LLM_ARCH_KIMI_LINEAR:
                 {
                     tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, 0);
@@ -8901,6 +9077,10 @@ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
             {
                 llm = std::make_unique<llm_build_mimo2_iswa>(*this, params);
             } break;
+        case LLM_ARCH_GLM5_NEXT:
+            {
+                llm = std::make_unique<llm_build_glm5_next>(*this, params);
+            } break;
         case LLM_ARCH_KIMI_LINEAR:
             {
                 llm = std::make_unique<llm_build_kimi_linear>(*this, params);
@@ -9058,6 +9238,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_WAVTOKENIZER_DEC:
         case LLM_ARCH_NEMOTRON_H:
         case LLM_ARCH_NEMOTRON_H_MOE:
+        case LLM_ARCH_GLM5_NEXT:   // NoPE: qk_rope_head_dim == 0 on the MLA path
         case LLM_ARCH_KIMI_LINEAR:
             return LLAMA_ROPE_TYPE_NONE;
 

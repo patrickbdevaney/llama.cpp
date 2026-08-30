@@ -486,6 +486,18 @@ struct llama_layer {
     struct ggml_tensor * indexer_proj     = nullptr;
     struct ggml_tensor * indexer_attn_k   = nullptr;
     struct ggml_tensor * indexer_attn_q_b = nullptr; // note: for lora a/b, not bias
+    struct ggml_tensor * indexer_kpool_ape  = nullptr;
+    struct ggml_tensor * indexer_kpool_gate = nullptr;
+
+    // mHC hyper-connections (GLM-5.3-Flash). Two sites per layer; each carries a projection
+    // `fn` producing (2+H)*H mixing logits, a `base` bias over the same, and 3 scalars that
+    // scale the pre/post/comb logit groups independently.
+    struct ggml_tensor * hc_attn_fn    = nullptr;
+    struct ggml_tensor * hc_attn_base  = nullptr;
+    struct ggml_tensor * hc_attn_scale = nullptr;
+    struct ggml_tensor * hc_ffn_fn     = nullptr;
+    struct ggml_tensor * hc_ffn_base   = nullptr;
+    struct ggml_tensor * hc_ffn_scale  = nullptr;
 
     // gemma4 layer output scale
     struct ggml_tensor * out_scale = nullptr;
