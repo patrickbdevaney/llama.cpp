@@ -26,6 +26,7 @@
 #define KEY_USE_GELU            "clip.use_gelu"
 #define KEY_USE_SILU            "clip.use_silu"
 #define KEY_VISION_SWIGLU_LIMIT "clip.vision.swiglu_limit"
+#define KEY_USE_MROPE          "clip.use_mrope"
 
 #define KEY_N_EMBD              "clip.%s.embedding_length"
 #define KEY_N_FF                "clip.%s.feed_forward_length"

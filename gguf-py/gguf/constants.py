@@ -322,6 +322,7 @@ class Keys:
         USE_GELU            = "clip.use_gelu"
         USE_SILU            = "clip.use_silu"
         SWIGLU_LIMIT        = "clip.vision.swiglu_limit"
+        USE_MROPE           = "clip.use_mrope"
         N_WA_PATTERN        = "clip.vision.n_wa_pattern" # used by qwen2.5vl
         WA_LAYER_INDEXES    = "clip.vision.wa_layer_indexes" # used by youtuvl
         IS_DEEPSTACK_LAYERS = "clip.vision.is_deepstack_layers"

@@ -1134,6 +1134,10 @@ struct clip_model_loader {
                 } else if (use_silu) {
                     hparams.ffn_op = FFN_SILU;
                     get_f32(KEY_VISION_SWIGLU_LIMIT, hparams.swiglu_limit, false);
+                    // get_bool returns void and leaves the target untouched when the key is
+                    // absent, so detect presence explicitly rather than inferring it.
+                    hparams.use_mrope_set = gguf_find_key(ctx_gguf.get(), KEY_USE_MROPE) >= 0;
+                    get_bool(KEY_USE_MROPE, hparams.use_mrope, false);
                     log_ffn_op = "silu";
                 } else {
                     hparams.ffn_op = FFN_GELU_QUICK;
@@ -2784,6 +2788,14 @@ int clip_n_output_tokens(const struct clip_ctx * ctx, struct clip_image_f32 * im
     }
 
     return n_patches;
+}
+
+bool clip_use_mrope(const struct clip_ctx * ctx) {
+    return ctx->model.hparams.use_mrope;
+}
+
+bool clip_use_mrope_is_set(const struct clip_ctx * ctx) {
+    return ctx->model.hparams.use_mrope_set;
 }
 
 bool clip_image_encode(struct clip_ctx * ctx, const int n_threads, clip_image_f32 * img, float * vec) {

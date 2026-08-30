@@ -989,6 +989,14 @@ bool mtmd_decode_use_non_causal(mtmd_context * ctx) {
 }
 
 bool mtmd_decode_use_mrope(mtmd_context * ctx) {
+    // An explicit clip.use_mrope in the mmproj wins. The projector family and the text model's
+    // rope scheme are independent: GLM-5.3 uses the GLM-4V tower with a NoPE text stack, so it
+    // needs GLM4V's graph but Qwen-style position counting OFF. Without this it advances an
+    // image by max(nx, ny) positions while submitting n_tokens of them, and the KV cache
+    // rejects the batch outright.
+    if (clip_use_mrope_is_set(ctx->ctx_v)) {
+        return clip_use_mrope(ctx->ctx_v);
+    }
     switch (ctx->proj_type_v()) {
         case PROJECTOR_TYPE_QWEN2VL:
         case PROJECTOR_TYPE_QWEN25VL:

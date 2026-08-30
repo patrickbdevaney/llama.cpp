@@ -4970,6 +4970,13 @@ class Glm5NextVisionModel(Glm4VVisionModel):
         if limit is not None:
             self.gguf_writer.add_vision_swiglu_limit(float(limit))
 
+        # GLM-4V uses M-RoPE, so mtmd advances position by max(nx, ny) for an image. GLM-5.3 is
+        # NoPE end to end (qk_rope_head_dim == 0, LLAMA_ROPE_TYPE_NONE), so an image must advance
+        # position by its full token count. Inheriting GLM-4V's behaviour submits 256 tokens while
+        # claiming 16 positions, and the KV cache rejects it:
+        #   "find_slot: non-consecutive token position 5 after 4 ... with 256 new tokens"
+        self.gguf_writer.add_vision_use_mrope(False)
+
 
 @ModelBase.register("Qwen3VLForConditionalGeneration")
 class Qwen3VLTextModel(Qwen3Model):

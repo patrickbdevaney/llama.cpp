@@ -80,6 +80,13 @@ struct clip_hparams {
     // activations exceed L - so it passes a small test and diverges on a real image.
     float swiglu_limit = 0.0f;
 
+    // Whether the TEXT model consumes image positions as M-RoPE. Defaults per projector type;
+    // a model may override it, because the projector family and the rope scheme are independent.
+    // GLM-5.3 uses the GLM-4V tower with a NoPE text stack, so it needs GLM4V's graph and
+    // Qwen-style position counting turned OFF.
+    bool use_mrope = false;
+    bool use_mrope_set = false;
+
     patch_merge_type mm_patch_merge_type = PATCH_MERGE_FLAT;
 
     float eps = 1e-6;

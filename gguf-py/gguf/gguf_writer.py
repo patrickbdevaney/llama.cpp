@@ -1193,6 +1193,9 @@ class GGUFWriter:
     def add_vision_use_gelu(self, value: bool) -> None:
         self.add_bool(Keys.ClipVision.USE_GELU, value)
 
+    def add_vision_use_mrope(self, value: bool) -> None:
+        self.add_bool(Keys.ClipVision.USE_MROPE, value)
+
     def add_vision_swiglu_limit(self, value: float) -> None:
         self.add_float32(Keys.ClipVision.SWIGLU_LIMIT, value)
 
