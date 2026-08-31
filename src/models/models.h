@@ -383,6 +383,14 @@ struct llm_build_glm5_next : public llm_build_delta_net_base {
     ggml_tensor * build_dsa_index_scores(ggml_tensor * x, ggml_tensor * q_a,
                                          const llama_layer & layer, int il);
 
+    // DSA sparse attention over the KV cache (decode only). Returns nullptr when the sparse
+    // path does not apply - notably at n_kv <= indexer_top_k, where selection is a no-op and
+    // dense IS the correct answer - and the caller falls back to dense build_attn.
+    ggml_tensor * build_attn_dsa(llm_graph_input_attn_k * inp, ggml_tensor * wo,
+                                 ggml_tensor * q_cur, ggml_tensor * k_cur, ggml_tensor * v_cur,
+                                 ggml_tensor * x, ggml_tensor * q_a, const llama_layer & layer,
+                                 ggml_tensor * v_mla, float kq_scale, int il);
+
     const llama_model & model;
 };
 

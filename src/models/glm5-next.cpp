@@ -1,5 +1,7 @@
 #include "models.h"
 
+#include "../llama-kv-cache.h"   // build_attn_dsa calls cpy_k/get_k on the cache context
+
 #include "llama-memory-recurrent.h"
 
 // GLM-5.3-Flash (glm5-next).
@@ -147,6 +149,182 @@ ggml_tensor * llm_build_glm5_next::build_dsa_index_scores(
     ggml_tensor * scp  = ggml_cont(ctx0, ggml_permute(ctx0, sc, 1, 0, 2, 3));
     ggml_tensor * idx  = ggml_mul_mat(ctx0, scp, wgt3);
     return ggml_reshape_2d(ctx0, idx, n_pools, S);
+}
+
+// DSA sparse attention over the KV cache (Phase 3).
+//
+// Selection happens at POOL granularity, and that is the whole trick that makes this tractable
+// in ggml. Cache rows for consecutive tokens are contiguous, so the [D, n_kv] cache view can be
+// re-viewed as [D*kpool, n_pools] and a single ggml_get_rows then gathers whole pools. No index
+// arithmetic at all - no scaling pool ids into token ids, no I32 maths ggml has no ops for - and
+// pool granularity is exactly DSA's own granularity, since select_k = indexer_top_k / kpool.
+//
+// Returns nullptr whenever the sparse path does not apply and the caller falls back to dense
+// build_attn. Two of those bail-outs are load-bearing rather than laziness:
+//
+//   * n_pools <= select_k is the FREE DSA invariant. Every pool would be selected, so selection
+//     is a no-op and sparse MUST equal dense exactly. Taking the dense path there makes that
+//     identity structural instead of something to hope a test catches.
+//   * n_tokens != 1 is prefill. top_k returns a per-token selection, but one gathered K/V can
+//     only serve one selection, so prefill would need block-sparse machinery this does not have.
+//     Decode is also where the win is: prefill is compute-bound, decode is KV-bandwidth-bound.
+//
+// KNOWN LIMITATION, and the reason this stays opt-in: pooling groups kpool CONSECUTIVE CACHE
+// CELLS, and treats them as kpool consecutive sequence positions. Those coincide for a single
+// sequence filling a fresh cache in order, which is the case this is written for. They stop
+// coinciding under anything that reorders cells against positions - a second sequence sharing a
+// unified cache, a context shift, defragmentation. Attention itself stays correct there, because
+// the gathered mask travels with the gathered rows; what degrades is the SELECTION, which would
+// pool unrelated positions and pick the wrong ones. That is a quality regression with no visible
+// symptom, so this must not be enabled by default until the pooling reads positions rather than
+// assuming them.
+//
+// The gathered-attention algebra itself (gather K/V, gather the mask through transpose ->
+// get_rows -> transpose, then build_attn_mha) is the construction proved against dense attention
+// in tests/test-dsa-attn.cpp at 1.19e-07.
+ggml_tensor * llm_build_glm5_next::build_attn_dsa(
+        llm_graph_input_attn_k * inp,
+        ggml_tensor * wo,
+        ggml_tensor * q_cur,
+        ggml_tensor * k_cur,
+        ggml_tensor * v_cur,
+        ggml_tensor * x,
+        ggml_tensor * q_a,
+        const llama_layer & layer,
+        ggml_tensor * v_mla,
+              float   kq_scale,
+              int     il) {
+    const int64_t hd = hparams.indexer_head_size;
+    const int64_t nh = hparams.indexer_n_head;
+    const int64_t kp = hparams.indexer_kpool ? hparams.indexer_kpool : 4;
+    const int64_t T  = q_cur->ne[2];
+
+    if (!hparams.dsa_enabled || !layer.indexer_attn_k || !layer.indexer_kpool_gate) {
+        return nullptr;
+    }
+    if (T != 1) {
+        return nullptr;                      // prefill: see above
+    }
+
+    // Every bail-out has to happen BEFORE the graph is touched. If this returned nullptr after
+    // expanding the stores, the caller's dense build_attn would emit a SECOND cpy_k into the same
+    // cache slots - so the guards below run against a get_k view that is created but not yet
+    // expanded, which costs a tensor header and nothing else.
+    const auto * mctx_cur = inp->mctx;
+
+    ggml_tensor * k = mctx_cur->get_k(ctx0, il);          // [D, n_head_kv, n_kv, ns]
+
+    const int64_t D       = k->ne[0];
+    const int64_t n_kv    = k->ne[2];
+    const int64_t kv_lora = v_cur->ne[0];
+
+    // The [D*kp, n_pools] re-view below reads the cache as raw contiguous memory, so everything
+    // that could make that untrue is a bail-out rather than an assert.
+    if (k->ne[1] != 1 || k->ne[3] != 1)                  return nullptr;  // MQA/multi-seq only
+    if (ggml_is_quantized(k->type))                      return nullptr;  // no fixed element size
+    if (k->type != GGML_TYPE_F32 && k->type != GGML_TYPE_F16) return nullptr;
+    if (D != kv_lora + 2*hd)                             return nullptr;  // row not widened
+    if (n_kv % kp != 0)                                  return nullptr;  // ragged final pool
+
+    const int64_t n_pools  = n_kv / kp;
+    const int64_t select_k = hparams.indexer_top_k / kp;
+
+    if (select_k <= 0 || n_pools <= select_k)            return nullptr;  // free DSA: dense == sparse
+
+    // Committed to the sparse path: now it is safe to mutate the graph.
+    ggml_build_forward_expand(gf, q_cur);
+    ggml_build_forward_expand(gf, v_cur);
+    ggml_build_forward_expand(gf, k_cur);
+    ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, inp->get_k_idxs(), il));
+
+    const size_t es = ggml_type_size(k->type);
+
+    // --- pooled indexer keys over the whole cache ------------------------------------------
+    // k_norm was applied before the key was written into the cache, so the stored indexer key is
+    // already normalised; re-normalising here would apply it twice.
+    ggml_tensor * ik = ggml_cont(ctx0,
+        ggml_view_2d(ctx0, k, hd, n_kv, (size_t) D*es, (size_t) kv_lora*es));
+    ggml_tensor * ig = ggml_cont(ctx0,
+        ggml_view_2d(ctx0, k, hd, n_kv, (size_t) D*es, (size_t) (kv_lora + hd)*es));
+    if (k->type != GGML_TYPE_F32) {
+        ik = ggml_cast(ctx0, ik, GGML_TYPE_F32);
+        ig = ggml_cast(ctx0, ig, GGML_TYPE_F32);
+    }
+
+    ggml_tensor * k3   = ggml_reshape_3d(ctx0, ik, hd, kp, n_pools);
+    ggml_tensor * g3   = ggml_reshape_3d(ctx0, ig, hd, kp, n_pools);
+    ggml_tensor * ape3 = ggml_reshape_3d(ctx0, layer.indexer_kpool_ape, hd, kp, 1);
+
+    // Per-channel softmax over the kp slots of (gate + ape) - not a mean. soft_max reduces ne0,
+    // so kp has to be brought there and put back.
+    ggml_tensor * lg = ggml_add(ctx0, g3, ape3);
+    lg = ggml_cont(ctx0, ggml_permute(ctx0, lg, 1, 0, 2, 3));
+    lg = ggml_soft_max(ctx0, lg);
+    lg = ggml_cont(ctx0, ggml_permute(ctx0, lg, 1, 0, 2, 3));
+
+    ggml_tensor * pk = ggml_mul(ctx0, lg, k3);
+    pk = ggml_cont(ctx0, ggml_permute(ctx0, pk, 1, 0, 2, 3));
+    pk = ggml_sum_rows(ctx0, pk);
+    pk = ggml_reshape_2d(ctx0, pk, hd, n_pools);
+
+    // --- score the pools against this token -------------------------------------------------
+    ggml_tensor * q = ggml_reshape_3d(ctx0, ggml_mul_mat(ctx0, layer.indexer_attn_q_b, q_a), hd, nh, T);
+
+    ggml_tensor * sc = ggml_mul_mat(ctx0, pk, q);                       // [n_pools, nh, T]
+    sc = ggml_scale(ctx0, sc, 1.0f/sqrtf((float) hd));
+    sc = ggml_relu(ctx0, sc);                                           // load-bearing
+
+    ggml_tensor * wgt  = ggml_scale(ctx0, ggml_mul_mat(ctx0, layer.indexer_proj, x),
+                                    1.0f/sqrtf((float) nh));
+    ggml_tensor * scp  = ggml_cont(ctx0, ggml_permute(ctx0, sc, 1, 0, 2, 3));
+    ggml_tensor * idx  = ggml_mul_mat(ctx0, scp, ggml_reshape_3d(ctx0, wgt, nh, 1, T));
+    ggml_tensor * scores = ggml_reshape_2d(ctx0, idx, n_pools, T);      // [n_pools, T]
+
+    ggml_tensor * kq_mask = inp->get_kq_mask();                         // [n_kv, T_pad]
+
+    // A pool must not be selected if none of its tokens are visible, or top_k spends slots on
+    // rows that attention will then mask to -inf. Under a causal mask a pool has a visible token
+    // iff its FIRST token is visible, so slot 0 of each pool is the exact pool-level mask - and
+    // -inf + finite is -inf, so adding it removes those pools from contention.
+    ggml_tensor * pmask = ggml_cont(ctx0,
+        ggml_view_3d(ctx0, kq_mask, 1, n_pools, T,
+                     (size_t) kp*ggml_type_size(kq_mask->type), kq_mask->nb[1], 0));
+    scores = ggml_add(ctx0, scores, ggml_reshape_2d(ctx0, pmask, n_pools, T));
+    cb(scores, "dsa_pool_scores", il);
+
+    ggml_tensor * sel = ggml_reshape_1d(ctx0, ggml_top_k(ctx0, scores, select_k), select_k);
+    cb(sel, "dsa_sel", il);
+
+    const int64_t n_sel = select_k * kp;
+
+    // --- gather K, V and the mask -----------------------------------------------------------
+    ggml_tensor * kpools = ggml_view_2d(ctx0, k, D*kp, n_pools, (size_t) (D*kp)*es, 0);
+    ggml_tensor * ksel   = ggml_get_rows(ctx0, kpools, sel);            // [D*kp, select_k], F32
+    ksel = ggml_reshape_4d(ctx0, ksel, D, 1, n_sel, 1);
+
+    // V is the leading kv_lora channels of the gathered row. wv_b expands from the compressed
+    // latent, so the indexer key and gate must not reach it.
+    ggml_tensor * vsel = ggml_view_4d(ctx0, ksel, kv_lora, ksel->ne[1], ksel->ne[2], ksel->ne[3],
+                                      ksel->nb[1], ksel->nb[2], ksel->nb[3], 0);
+
+    // The mask is [n_kv, T_pad] and get_rows selects along ne1, so it has to be transposed,
+    // gathered, and transposed back. This is the pattern proved in tests/test-dsa-attn.cpp.
+    const int64_t T_pad = kq_mask->ne[1];
+    ggml_tensor * mt   = ggml_cont(ctx0, ggml_transpose(ctx0, kq_mask));    // [T_pad, n_kv]
+    mt = ggml_reshape_2d(ctx0, mt, T_pad*kp, n_pools);
+    ggml_tensor * msel = ggml_get_rows(ctx0, mt, sel);                      // [T_pad*kp, select_k]
+    msel = ggml_reshape_2d(ctx0, msel, T_pad, n_sel);
+    msel = ggml_cont(ctx0, ggml_transpose(ctx0, msel));                     // [n_sel, T_pad]
+    cb(msel, "dsa_mask_sel", il);
+
+    ggml_tensor * cur = build_attn_mha(q_cur, ksel, vsel, nullptr, msel, nullptr,
+                                       v_mla, kq_scale, il);
+    cb(cur, "kqv_out", il);
+
+    if (wo) {
+        cur = build_lora_mm(wo, cur);
+    }
+    return cur;
 }
 
 llm_build_glm5_next::mhc_site llm_build_glm5_next::build_mhc(
@@ -437,8 +615,16 @@ llm_build_glm5_next::llm_build_glm5_next(const llama_model & model, const llm_gr
                     cb(Kcur, "dsa_k_widened", il);
                 }
 
-                cur = build_attn(inp_attn_k, layer.wo, NULL, Qcur, Kcur, Vcur,
-                                 nullptr, nullptr, layer.wv_b, kq_scale_mla, il);
+                // Sparse selection when it applies, dense otherwise. build_attn_dsa returns
+                // nullptr for every case it does not handle (prefill, short context, an
+                // un-widened row), so the dense path stays the default and the fallback is a
+                // plain null check rather than a duplicated condition that could drift.
+                cur = build_attn_dsa(inp_attn_k, layer.wo, Qcur, Kcur, Vcur,
+                                     cur, q_a, layer, layer.wv_b, kq_scale_mla, il);
+                if (cur == nullptr) {
+                    cur = build_attn(inp_attn_k, layer.wo, NULL, Qcur, Kcur, Vcur,
+                                     nullptr, nullptr, layer.wv_b, kq_scale_mla, il);
+                }
             } else {
                 Qcur = ggml_reshape_3d(ctx0, Qcur, n_embd_head_k_mla, n_head, n_tokens);
                 ggml_tensor * kv = ggml_mul_mat(ctx0, layer.wkv_b, kv_cmpr);
