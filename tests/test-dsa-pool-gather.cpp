@@ -73,8 +73,8 @@ int main() {
 
     // 1. K gather at pool granularity
     ggml_tensor * kpools = ggml_view_2d(ctx, k, D*kpool, n_pools, (size_t) (D*kpool)*es, 0);
-    ggml_tensor * ksel   = ggml_get_rows(ctx, kpools, ids);
-    ksel = ggml_reshape_4d(ctx, ksel, D, 1, sel, 1);
+    ggml_tensor * ksel_pre = ggml_get_rows(ctx, kpools, ids);          // [D*kpool, select_k]
+    ggml_tensor * ksel = ggml_reshape_4d(ctx, ksel_pre, D, 1, sel, 1);
 
     // V is the leading kv_lora channels of the gathered row, exactly as in build_attn_dsa.
     ggml_tensor * vsel = ggml_view_4d(ctx, ksel, kv_lora, ksel->ne[1], ksel->ne[2], ksel->ne[3],
@@ -91,15 +91,32 @@ int main() {
     // 2. mask gather: transpose -> pool rows -> get_rows -> back
     ggml_tensor * mt = ggml_cont(ctx, ggml_transpose(ctx, mask));      // [T, n_kv]
     mt = ggml_reshape_2d(ctx, mt, T*kpool, n_pools);
-    ggml_tensor * msel = ggml_get_rows(ctx, mt, ids);                  // [T*kpool, select_k]
-    msel = ggml_reshape_2d(ctx, msel, T, sel);
+    ggml_tensor * msel_pre = ggml_get_rows(ctx, mt, ids);              // [T*kpool, select_k]
+    ggml_tensor * msel = ggml_reshape_2d(ctx, msel_pre, T, sel);
     msel = ggml_cont(ctx, ggml_transpose(ctx, msel));                  // [sel, T]
 
     // 3. pool-level mask: slot 0 of each pool, strided along ne0
     ggml_tensor * pmask = ggml_cont(ctx,
         ggml_view_3d(ctx, mask, 1, n_pools, T, (size_t) kpool*es, mask->nb[1], 0));
 
+    // --- tail pool: the newest 1..kpool-1 tokens ---------------------------------------------
+    // n_kv is padded up to a multiple of 256, so the live window ends mid-pool. That partial pool
+    // holds the NEWEST tokens, which a decode step must not lose, and it cannot be scored because
+    // it is not a whole pool. It is appended by VIEW at a host-known offset rather than selected,
+    // which is also why top_k can never pick it twice: scoring only sees the complete pools.
+    const int n_full = 5;                      // complete pools of real tokens
+    ggml_tensor * ktail = ggml_view_2d(ctx, cache, D*kpool, 1, (size_t) (D*kpool)*es,
+                                       (size_t) (n_full*kpool*D)*es);
+    ggml_tensor * kall  = ggml_concat(ctx, ksel_pre, ggml_cast(ctx, ktail, ksel_pre->type), 1);
+
+    ggml_tensor * mtail = ggml_view_2d(ctx, mt, T*kpool, 1, mt->nb[1], (size_t) n_full*mt->nb[1]);
+    ggml_tensor * mall  = ggml_concat(ctx, msel_pre, ggml_cast(ctx, mtail, msel_pre->type), 1);
+    mall = ggml_reshape_2d(ctx, mall, T, sel + kpool);
+    mall = ggml_cont(ctx, ggml_transpose(ctx, mall));
+
     ggml_cgraph * gf = ggml_new_graph(ctx);
+    ggml_build_forward_expand(gf, kall);
+    ggml_build_forward_expand(gf, mall);
     ggml_build_forward_expand(gf, ksel);
     ggml_build_forward_expand(gf, vsel_c);
     ggml_build_forward_expand(gf, msel);
@@ -150,6 +167,34 @@ int main() {
         if (pool != pool_ids[s / kpool]) { ok_excl = false; break; }
     }
     check(ok_excl, "unselected pools are absent from the gather");
+
+    // the appended pool must be pool n_full, sitting after the selected ones
+    const float * ka = (const float *) kall->data;
+    bool ok_tail = true;
+    for (int j = 0; j < kpool && ok_tail; j++) {
+        const int tok = n_full*kpool + j;
+        for (int c = 0; c < D; c++)
+            if (ka[(sel + j)*D + c] != 1000.0f*tok + c) { ok_tail = false; break; }
+    }
+    check(ok_tail, "tail pool is appended by view, after the selected pools");
+
+    // and the selected pools must be untouched by the append
+    bool ok_keep = true;
+    for (int s2 = 0; s2 < sel && ok_keep; s2++) {
+        const int tok = pool_ids[s2 / kpool]*kpool + (s2 % kpool);
+        for (int c = 0; c < D; c++)
+            if (ka[s2*D + c] != 1000.0f*tok + c) { ok_keep = false; break; }
+    }
+    check(ok_keep, "appending the tail does not disturb the selected rows");
+
+    const float * ma = (const float *) mall->data;
+    bool ok_mtail = true;
+    for (int t = 0; t < T && ok_mtail; t++)
+        for (int j = 0; j < kpool; j++) {
+            const int tok = n_full*kpool + j;
+            if (ma[t*(sel + kpool) + sel + j] != 100.0f*tok + t) { ok_mtail = false; break; }
+        }
+    check(ok_mtail, "tail mask row stays paired with the tail K rows");
 
     ggml_free(ctx);
     printf("\n%s\n", failures ? "FAILED" : "PASS");

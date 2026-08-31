@@ -1632,6 +1632,28 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
     //LLAMA_LOG_ERROR("%s: kq mask time: %0.3f ms\n", __func__, (t_end - t_start)/1000.0);
 }
 
+uint32_t llama_kv_cache::pos_ordered_prefix(uint32_t n_kv_) const {
+    if (n_stream != 1) {
+        return 0;
+    }
+    const auto & cells = v_cells[0];
+    if (n_kv_ > cells.size()) {
+        return 0;
+    }
+    uint32_t n = 0;
+    while (n < n_kv_ && !cells.is_empty(n) && cells.pos_get(n) == (llama_pos) n) {
+        ++n;
+    }
+    // Everything after the ordered prefix must be empty padding. A filled cell out there means
+    // the cache holds content this pooling cannot account for, so refuse rather than pool it.
+    for (uint32_t i = n; i < n_kv_; ++i) {
+        if (!cells.is_empty(i)) {
+            return 0;
+        }
+    }
+    return n;
+}
+
 void llama_kv_cache::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {
     const int64_t n_tokens = ubatch->n_tokens;
 
@@ -2477,6 +2499,13 @@ void llama_kv_cache_context::set_input_v_idxs(ggml_tensor * dst, const llama_uba
 
 void llama_kv_cache_context::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
     kv->set_input_kq_mask(dst, ubatch, causal_attn);
+}
+
+uint32_t llama_kv_cache_context::pos_ordered_prefix() const {
+    if (cached_pos_prefix < 0) {
+        cached_pos_prefix = (int64_t) kv->pos_ordered_prefix((uint32_t) n_kv);
+    }
+    return (uint32_t) cached_pos_prefix;
 }
 
 void llama_kv_cache_context::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {

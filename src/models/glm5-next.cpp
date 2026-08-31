@@ -169,15 +169,13 @@ ggml_tensor * llm_build_glm5_next::build_dsa_index_scores(
 //     only serve one selection, so prefill would need block-sparse machinery this does not have.
 //     Decode is also where the win is: prefill is compute-bound, decode is KV-bandwidth-bound.
 //
-// KNOWN LIMITATION, and the reason this stays opt-in: pooling groups kpool CONSECUTIVE CACHE
-// CELLS, and treats them as kpool consecutive sequence positions. Those coincide for a single
-// sequence filling a fresh cache in order, which is the case this is written for. They stop
-// coinciding under anything that reorders cells against positions - a second sequence sharing a
-// unified cache, a context shift, defragmentation. Attention itself stays correct there, because
-// the gathered mask travels with the gathered rows; what degrades is the SELECTION, which would
-// pool unrelated positions and pick the wrong ones. That is a quality regression with no visible
-// symptom, so this must not be enabled by default until the pooling reads positions rather than
-// assuming them.
+// Pooling groups kpool consecutive CACHE CELLS and treats them as kpool consecutive sequence
+// POSITIONS. That coincidence holds for a single sequence filling a fresh cache in order and
+// breaks under anything that reorders cells against positions - a second sequence sharing a
+// unified cache, a context shift, defragmentation. Attention would stay correct there (the
+// gathered mask travels with the gathered rows) but SELECTION would pool unrelated positions and
+// drop the context the answer needed, which is a quality regression with no visible symptom.
+// So the cache is asked, via llama_kv_cache::pos_ordered_prefix, instead of assumed.
 //
 // The gathered-attention algebra itself (gather K/V, gather the mask through transpose ->
 // get_rows -> transpose, then build_attn_mha) is the construction proved against dense attention
@@ -226,10 +224,25 @@ ggml_tensor * llm_build_glm5_next::build_attn_dsa(
     if (D != kv_lora + 2*hd)                             return nullptr;  // row not widened
     if (n_kv % kp != 0)                                  return nullptr;  // ragged final pool
 
-    const int64_t n_pools  = n_kv / kp;
+    // Pooling groups kpool consecutive CELLS and calls them kpool consecutive POSITIONS. Ask the
+    // cache rather than assume it, and take the length of the ordered prefix while we are here:
+    // n_kv is padded up to a multiple of 256, so the tail of the window is empty cells that must
+    // not be pooled as if they held content.
+    const int64_t n_used = (int64_t) mctx_cur->pos_ordered_prefix();
+    if (n_used == 0)                                     return nullptr;
+
+    const int64_t n_src   = n_kv / kp;      // pool rows the gather source spans, padding included
+    const int64_t n_full  = n_used / kp;    // complete pools of real tokens - the selectable set
+    const int64_t n_tail  = (n_used % kp) ? 1 : 0;
     const int64_t select_k = hparams.indexer_top_k / kp;
 
-    if (select_k <= 0 || n_pools <= select_k)            return nullptr;  // free DSA: dense == sparse
+    if (select_k <= 0 || n_full <= select_k)             return nullptr;  // free DSA: dense == sparse
+
+    // The partial pool holds the NEWEST 1..kp-1 tokens, which are exactly the ones a decode step
+    // must not lose, and it cannot be scored because it is not a whole pool. It is always
+    // attended instead of selected: its position is known on the host, so it is a plain view
+    // concatenated onto the gather - no index tensor, and no way for top_k to pick it twice
+    // since scoring only ever sees the n_full complete pools.
 
     // Committed to the sparse path: now it is safe to mutate the graph.
     ggml_build_forward_expand(gf, q_cur);
@@ -242,17 +255,18 @@ ggml_tensor * llm_build_glm5_next::build_attn_dsa(
     // --- pooled indexer keys over the whole cache ------------------------------------------
     // k_norm was applied before the key was written into the cache, so the stored indexer key is
     // already normalised; re-normalising here would apply it twice.
+    const int64_t n_scored = n_full * kp;   // real tokens in complete pools
     ggml_tensor * ik = ggml_cont(ctx0,
-        ggml_view_2d(ctx0, k, hd, n_kv, (size_t) D*es, (size_t) kv_lora*es));
+        ggml_view_2d(ctx0, k, hd, n_scored, (size_t) D*es, (size_t) kv_lora*es));
     ggml_tensor * ig = ggml_cont(ctx0,
-        ggml_view_2d(ctx0, k, hd, n_kv, (size_t) D*es, (size_t) (kv_lora + hd)*es));
+        ggml_view_2d(ctx0, k, hd, n_scored, (size_t) D*es, (size_t) (kv_lora + hd)*es));
     if (k->type != GGML_TYPE_F32) {
         ik = ggml_cast(ctx0, ik, GGML_TYPE_F32);
         ig = ggml_cast(ctx0, ig, GGML_TYPE_F32);
     }
 
-    ggml_tensor * k3   = ggml_reshape_3d(ctx0, ik, hd, kp, n_pools);
-    ggml_tensor * g3   = ggml_reshape_3d(ctx0, ig, hd, kp, n_pools);
+    ggml_tensor * k3   = ggml_reshape_3d(ctx0, ik, hd, kp, n_full);
+    ggml_tensor * g3   = ggml_reshape_3d(ctx0, ig, hd, kp, n_full);
     ggml_tensor * ape3 = ggml_reshape_3d(ctx0, layer.indexer_kpool_ape, hd, kp, 1);
 
     // Per-channel softmax over the kp slots of (gate + ape) - not a mean. soft_max reduces ne0,
@@ -265,7 +279,7 @@ ggml_tensor * llm_build_glm5_next::build_attn_dsa(
     ggml_tensor * pk = ggml_mul(ctx0, lg, k3);
     pk = ggml_cont(ctx0, ggml_permute(ctx0, pk, 1, 0, 2, 3));
     pk = ggml_sum_rows(ctx0, pk);
-    pk = ggml_reshape_2d(ctx0, pk, hd, n_pools);
+    pk = ggml_reshape_2d(ctx0, pk, hd, n_full);
 
     // --- score the pools against this token -------------------------------------------------
     ggml_tensor * q = ggml_reshape_3d(ctx0, ggml_mul_mat(ctx0, layer.indexer_attn_q_b, q_a), hd, nh, T);
@@ -278,7 +292,7 @@ ggml_tensor * llm_build_glm5_next::build_attn_dsa(
                                     1.0f/sqrtf((float) nh));
     ggml_tensor * scp  = ggml_cont(ctx0, ggml_permute(ctx0, sc, 1, 0, 2, 3));
     ggml_tensor * idx  = ggml_mul_mat(ctx0, scp, ggml_reshape_3d(ctx0, wgt, nh, 1, T));
-    ggml_tensor * scores = ggml_reshape_2d(ctx0, idx, n_pools, T);      // [n_pools, T]
+    ggml_tensor * scores = ggml_reshape_2d(ctx0, idx, n_full, T);       // [n_full, T]
 
     ggml_tensor * kq_mask = inp->get_kq_mask();                         // [n_kv, T_pad]
 
@@ -287,19 +301,26 @@ ggml_tensor * llm_build_glm5_next::build_attn_dsa(
     // iff its FIRST token is visible, so slot 0 of each pool is the exact pool-level mask - and
     // -inf + finite is -inf, so adding it removes those pools from contention.
     ggml_tensor * pmask = ggml_cont(ctx0,
-        ggml_view_3d(ctx0, kq_mask, 1, n_pools, T,
+        ggml_view_3d(ctx0, kq_mask, 1, n_full, T,
                      (size_t) kp*ggml_type_size(kq_mask->type), kq_mask->nb[1], 0));
-    scores = ggml_add(ctx0, scores, ggml_reshape_2d(ctx0, pmask, n_pools, T));
+    scores = ggml_add(ctx0, scores, ggml_reshape_2d(ctx0, pmask, n_full, T));
     cb(scores, "dsa_pool_scores", il);
 
     ggml_tensor * sel = ggml_reshape_1d(ctx0, ggml_top_k(ctx0, scores, select_k), select_k);
     cb(sel, "dsa_sel", il);
 
-    const int64_t n_sel = select_k * kp;
+    const int64_t n_sel = (select_k + n_tail) * kp;
 
     // --- gather K, V and the mask -----------------------------------------------------------
-    ggml_tensor * kpools = ggml_view_2d(ctx0, k, D*kp, n_pools, (size_t) (D*kp)*es, 0);
+    // Rows of the source span the padded window; selection can only ever name a pool below
+    // n_full, and the tail pool is appended by view rather than by index.
+    ggml_tensor * kpools = ggml_view_2d(ctx0, k, D*kp, n_src, (size_t) (D*kp)*es, 0);
     ggml_tensor * ksel   = ggml_get_rows(ctx0, kpools, sel);            // [D*kp, select_k], F32
+    if (n_tail) {
+        ggml_tensor * ktail = ggml_view_2d(ctx0, k, D*kp, 1, (size_t) (D*kp)*es,
+                                           (size_t) (n_full*kp*D)*es);
+        ksel = ggml_concat(ctx0, ksel, ggml_cast(ctx0, ktail, ksel->type), 1);
+    }
     ksel = ggml_reshape_4d(ctx0, ksel, D, 1, n_sel, 1);
 
     // V is the leading kv_lora channels of the gathered row. wv_b expands from the compressed
@@ -309,10 +330,18 @@ ggml_tensor * llm_build_glm5_next::build_attn_dsa(
 
     // The mask is [n_kv, T_pad] and get_rows selects along ne1, so it has to be transposed,
     // gathered, and transposed back. This is the pattern proved in tests/test-dsa-attn.cpp.
+    // The tail pool's mask row is appended the same way its K was, keeping mask rows paired with
+    // the K rows they mask - and it is the mask, not the selection, that hides the padding slots
+    // inside that partial pool.
     const int64_t T_pad = kq_mask->ne[1];
     ggml_tensor * mt   = ggml_cont(ctx0, ggml_transpose(ctx0, kq_mask));    // [T_pad, n_kv]
-    mt = ggml_reshape_2d(ctx0, mt, T_pad*kp, n_pools);
+    mt = ggml_reshape_2d(ctx0, mt, T_pad*kp, n_src);
     ggml_tensor * msel = ggml_get_rows(ctx0, mt, sel);                      // [T_pad*kp, select_k]
+    if (n_tail) {
+        ggml_tensor * mtail = ggml_view_2d(ctx0, mt, T_pad*kp, 1, mt->nb[1],
+                                           (size_t) n_full*mt->nb[1]);
+        msel = ggml_concat(ctx0, msel, ggml_cast(ctx0, mtail, msel->type), 1);
+    }
     msel = ggml_reshape_2d(ctx0, msel, T_pad, n_sel);
     msel = ggml_cont(ctx0, ggml_transpose(ctx0, msel));                     // [n_sel, T_pad]
     cb(msel, "dsa_mask_sel", il);

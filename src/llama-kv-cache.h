@@ -204,6 +204,16 @@ public:
 
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
+    // Length of the leading run of cells where cell i holds sequence position i, or 0 if the
+    // layout is unusable for pooled selection. Cells past that run must all be EMPTY, which is
+    // the normal case rather than a defect: get_n_kv pads n_kv up to a multiple of 256.
+    //
+    // DSA pooling groups kpool consecutive CELLS and treats them as kpool consecutive POSITIONS.
+    // That coincidence breaks under a shared unified cache, a context shift or defragmentation,
+    // where attention itself stays correct (the mask travels with the gathered rows) but
+    // SELECTION would pool unrelated positions and drop the context the answer needed - a
+    // quality regression with no visible symptom. So the sparse path asks rather than assumes.
+    uint32_t pos_ordered_prefix(uint32_t n_kv) const;
 
     void set_input_k_rot(ggml_tensor * dst) const;
     void set_input_v_rot(ggml_tensor * dst) const;
@@ -376,6 +386,9 @@ public:
     void set_input_k_shift   (ggml_tensor * dst) const;
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
+    // See llama_kv_cache::pos_ordered_prefix. Memoised: the sparse path asks once per layer and
+    // the answer cannot change within one ubatch.
+    uint32_t pos_ordered_prefix() const;
 
     void set_input_k_rot(ggml_tensor * dst) const;
     void set_input_v_rot(ggml_tensor * dst) const;
@@ -412,4 +425,6 @@ private:
     // a heuristic, to avoid attending the full cache if it is not yet utilized
     // as the cache gets filled, the benefit from this heuristic disappears
     int32_t n_kv;
+
+    mutable int64_t cached_pos_prefix = -1;   // -1 unknown, else the prefix length
 };
