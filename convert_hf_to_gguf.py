@@ -6127,6 +6127,28 @@ class Glm5NextModel(TextModel):
     def set_vocab(self):
         self._set_vocab_gpt2()
 
+        # GLM-5.3 has THREE end-of-generation tokens. generation_config.json lists
+        # eos_token_id = [154820 <|endoftext|>, 154827 <|user|>, 154829 <|observation|>], but a
+        # GGUF carries only one eos id, so the other two were being dropped and llama.cpp ended up
+        # with <|endoftext|> as its only EOG token.
+        #
+        # That is not cosmetic. The model ends an assistant turn with <|user|>, so with only
+        # <|endoftext|> registered nothing stops generation: the model answers, emits <|user|>,
+        # then hallucinates a follow-up question and answers that too. Observed directly - a
+        # chart-reading answer was correct in the first turn and wrong in the fabricated second.
+        #
+        # llama.cpp folds eos, eot and eom into its EOG set (llama-vocab.cpp), and neither
+        # <|user|> nor <|observation|> is in its name-matching list, so map the extra two onto
+        # eot/eom, which is what those fields are for.
+        gen_cfg = self.dir_model / "generation_config.json"
+        if gen_cfg.is_file():
+            with open(gen_cfg, encoding="utf-8") as f:
+                eos_ids = json.load(f).get("eos_token_id")
+            if isinstance(eos_ids, list) and len(eos_ids) > 1:
+                for field, tid in zip(("eot", "eom"), eos_ids[1:]):
+                    getattr(self.gguf_writer, f"add_{field}_token_id")(int(tid))
+                    logger.info(f"gguf: {field} token id = {tid}")
+
     def set_gguf_parameters(self):
         super().set_gguf_parameters()
         self.gguf_writer.add_vocab_size(self.hparams["vocab_size"])
