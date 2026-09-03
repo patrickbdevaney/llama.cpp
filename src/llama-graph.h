@@ -120,6 +120,25 @@ public:
     const int64_t n_embd = 0;
 };
 
+// The previous-token hidden state consumed by a GLM-5.3 MTP draft. Row i is the target model's
+// final hidden state for batch token i, and is supplied out-of-band via llama_set_mtp_hidden()
+// because a llama_batch has no slot for it.
+class llm_graph_input_mtp_hidden : public llm_graph_input_i {
+public:
+    llm_graph_input_mtp_hidden(int64_t n_embd, const float * src) : n_embd(n_embd), src(src) {}
+    virtual ~llm_graph_input_mtp_hidden() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    bool can_reuse(const llm_graph_params & params) override;
+
+    ggml_tensor * h_prev = nullptr; // F32 [n_embd,  n_batch]
+    ggml_tensor * emask  = nullptr; // F32 [1,       n_batch]  0 at position 0, else 1
+
+    const int64_t n_embd = 0;
+    const float * src    = nullptr; // stable, owned by llama_context
+};
+
 class llm_graph_input_pos : public llm_graph_input_i {
 public:
     llm_graph_input_pos(uint32_t n_pos_per_embd) : n_pos_per_embd(n_pos_per_embd) {}
@@ -860,6 +879,7 @@ struct llm_graph_context {
 
     ggml_tensor * build_inp_embd(ggml_tensor * tok_embd) const;
     ggml_tensor * build_inp_pos() const;
+    llm_graph_input_mtp_hidden * build_inp_mtp_hidden() const;
     ggml_tensor * build_inp_attn_scale() const;
     ggml_tensor * build_inp_out_ids() const;
     ggml_tensor * build_inp_mean() const;

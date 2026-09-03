@@ -974,6 +974,22 @@ extern "C" {
     // TODO: rename to avoid confusion with llama_get_embeddings()
     LLAMA_API void llama_set_embeddings(struct llama_context * ctx, bool embeddings);
 
+    // Restrict embedding extraction to tokens that are already outputs, instead of promoting
+    // every token in the batch to an output (the default, which suits embedding models). A
+    // speculative draft that conditions on the target's hidden state needs this: without it,
+    // enabling embeddings on a generation context would allocate an n_vocab logits row for
+    // every prompt token.
+    LLAMA_API void llama_set_embeddings_outputs_only(struct llama_context * ctx, bool value);
+
+    // Supply the target model's hidden states to a GLM-5.3 MTP draft context, one n_embd-sized
+    // row per token of the batch that is about to be decoded, in batch order. Must be called
+    // before each llama_decode() on such a context; other architectures ignore it.
+    // The rows are copied, so `data` need not outlive the call.
+    LLAMA_API void llama_set_mtp_hidden(
+            struct llama_context * ctx,
+                     const float * data,
+                         int32_t   n_tokens);
+
     // Set whether to use causal attention or not
     // If set to true, the model will only attend to the past tokens
     LLAMA_API void llama_set_causal_attn(struct llama_context * ctx, bool causal_attn);

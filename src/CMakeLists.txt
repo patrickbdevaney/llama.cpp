@@ -76,6 +76,7 @@ add_library(llama
             models/gemma4-iswa.cpp
             models/glm4-moe.cpp
             models/glm5-next.cpp
+            models/glm5-next-mtp.cpp
             models/glm4.cpp
             models/gpt2.cpp
             models/gptneox.cpp

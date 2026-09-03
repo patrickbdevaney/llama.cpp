@@ -394,6 +394,14 @@ struct llm_build_glm5_next : public llm_build_delta_net_base {
     const llama_model & model;
 };
 
+// GLM-5.3's MTP module as a standalone speculative draft: one MLA+DSA layer and one MoE, fed
+// the target model's hidden state through llama_set_mtp_hidden(). No KDA and no mHC.
+struct llm_build_glm5_next_mtp : public llm_graph_context {
+    llm_build_glm5_next_mtp(const llama_model & model, const llm_graph_params & params);
+
+    const llama_model & model;
+};
+
 struct llm_build_kimi_linear : public llm_build_delta_net_base {
     llm_build_kimi_linear(const llama_model & model, const llm_graph_params & params);
 

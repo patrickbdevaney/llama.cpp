@@ -47,6 +47,9 @@ llama_context::llama_context(
     cparams.yarn_beta_fast   = params.yarn_beta_fast   >= 0.0f ? params.yarn_beta_fast   : hparams.yarn_beta_fast;
     cparams.yarn_beta_slow   = params.yarn_beta_slow   >= 0.0f ? params.yarn_beta_slow   : hparams.yarn_beta_slow;
     cparams.embeddings       = params.embeddings;
+    cparams.embd_outputs_only = false;
+    cparams.mtp_h_prev       = nullptr;
+    cparams.mtp_h_prev_n     = 0;
     cparams.offload_kqv      = params.offload_kqv;
     cparams.no_perf          = params.no_perf;
     cparams.pooling_type     = params.pooling_type;
@@ -198,6 +201,16 @@ llama_context::llama_context(
     LLAMA_LOG_INFO("%s: n_ctx         = %u\n",   __func__, cparams.n_ctx);
     LLAMA_LOG_INFO("%s: n_ctx_seq     = %u\n",   __func__, cparams.n_ctx_seq);
     LLAMA_LOG_INFO("%s: n_batch       = %u\n",   __func__, cparams.n_batch);
+
+    // A GLM-5.3 MTP draft reads the target's hidden state from this buffer on every decode.
+    // Allocate it up front, at full batch width, for two reasons: the graph captures the
+    // pointer when it is built, so it must never move; and the warmup decode happens before
+    // any caller has had a chance to supply hidden states, which would otherwise be a crash
+    // on model load rather than a working (if uninformative) warmup against zeros.
+    if (model.arch == LLM_ARCH_GLM5_NEXT_MTP) {
+        mtp_h_prev.resize((size_t) model.hparams.n_embd * cparams.n_batch, 0.0f);
+        cparams.mtp_h_prev = mtp_h_prev.data();
+    }
     LLAMA_LOG_INFO("%s: n_ubatch      = %u\n",   __func__, cparams.n_ubatch);
     LLAMA_LOG_INFO("%s: causal_attn   = %d\n",   __func__, cparams.causal_attn);
     LLAMA_LOG_INFO("%s: flash_attn    = %s\n",   __func__, llama_flash_attn_type_name(params.flash_attn_type));
@@ -1036,6 +1049,36 @@ void llama_context::set_embeddings(bool value) {
     //sched_need_reserve = true;
 }
 
+void llama_context::set_embeddings_outputs_only(bool value) {
+    LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
+
+    cparams.embd_outputs_only = value;
+}
+
+void llama_context::set_mtp_hidden(const float * data, int32_t n_tokens) {
+    const int64_t n_embd = model.hparams.n_embd;
+
+    if (model.arch != LLM_ARCH_GLM5_NEXT_MTP) {
+        LLAMA_LOG_ERROR("%s: called on a non-MTP model (arch %s)\n",
+                __func__, llm_arch_name(model.arch));
+        return;
+    }
+
+    if (n_tokens <= 0 || (uint32_t) n_tokens > cparams.n_batch) {
+        LLAMA_LOG_ERROR("%s: n_tokens = %d out of range (n_batch = %u)\n",
+                __func__, n_tokens, cparams.n_batch);
+        return;
+    }
+
+    // Allocated once at full batch width and never resized, because the graph captures this
+    // pointer when it is built and would otherwise be left holding a freed buffer after a
+    // reallocation.
+    GGML_ASSERT(!mtp_h_prev.empty() && "MTP hidden buffer was not allocated at context creation");
+
+    std::copy(data, data + (size_t) n_embd*n_tokens, mtp_h_prev.begin());
+    cparams.mtp_h_prev_n = n_tokens;
+}
+
 void llama_context::set_causal_attn(bool value) {
     LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
 
@@ -1545,8 +1588,9 @@ int llama_context::decode(const llama_batch & batch_inp) {
     const int64_t n_vocab = vocab.n_tokens();
     const int64_t n_embd  = hparams.n_embd_inp();
 
-    // when computing embeddings, all tokens are output
-    const bool output_all   = cparams.embeddings;
+    // when computing embeddings, all tokens are output - unless the caller only wants hidden
+    // states for the tokens it already asked for (see llama_set_embeddings_outputs_only)
+    const bool output_all   = cparams.embeddings && !cparams.embd_outputs_only;
     const bool has_samplers = !sampling.samplers.empty();
 
     const uint32_t n_seq_max = cparams.kv_unified ? LLAMA_MAX_SEQ : cparams.n_seq_max;
@@ -2066,7 +2110,7 @@ void llama_context::output_reorder() {
 //
 
 uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
-    if (model.arch == LLM_ARCH_QWEN3NEXT || model.arch == LLM_ARCH_KIMI_LINEAR || model.arch == LLM_ARCH_QWEN35 || model.arch == LLM_ARCH_QWEN35MOE) {
+    if (model.arch == LLM_ARCH_QWEN3NEXT || model.arch == LLM_ARCH_KIMI_LINEAR || model.arch == LLM_ARCH_QWEN35 || model.arch == LLM_ARCH_QWEN35MOE || model.arch == LLM_ARCH_GLM5_NEXT) {
         return std::max<uint32_t>(n_tokens * 40, 32u * model.n_tensors());
     }
     uint32_t res = std::max<uint32_t>(1024u, 8u*model.n_tensors());
@@ -3054,6 +3098,14 @@ void llama_set_abort_callback(llama_context * ctx, bool (*abort_callback)(void *
 
 void llama_set_embeddings(llama_context * ctx, bool embeddings) {
     ctx->set_embeddings(embeddings);
+}
+
+void llama_set_embeddings_outputs_only(llama_context * ctx, bool value) {
+    ctx->set_embeddings_outputs_only(value);
+}
+
+void llama_set_mtp_hidden(llama_context * ctx, const float * data, int32_t n_tokens) {
+    ctx->set_mtp_hidden(data, n_tokens);
 }
 
 void llama_set_causal_attn(llama_context * ctx, bool causal_attn) {

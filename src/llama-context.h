@@ -102,6 +102,8 @@ struct llama_context {
     void set_abort_callback(bool (*abort_callback)(void * data), void * abort_callback_data);
 
     void set_embeddings (bool value);
+    void set_mtp_hidden (const float * data, int32_t n_tokens);
+    void set_embeddings_outputs_only(bool value);
     void set_causal_attn(bool value);
     void set_warmup(bool value);
 
@@ -337,6 +339,10 @@ private:
 
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;
+
+    // Target-model hidden states for a GLM-5.3 MTP draft. Sized once from n_embd*n_batch so the
+    // pointer handed to the graph never moves; empty for every other architecture.
+    std::vector<float> mtp_h_prev;
 
     bool has_evaluated_once = false;
 

@@ -133,6 +133,7 @@ static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
     { LLM_ARCH_MAINCODER,        "maincoder"        },
     { LLM_ARCH_KIMI_LINEAR,      "kimi-linear"      },
     { LLM_ARCH_GLM5_NEXT,        "glm5-next"        },
+    { LLM_ARCH_GLM5_NEXT_MTP,    "glm5-next-mtp"    },
     { LLM_ARCH_UNKNOWN,          "(unknown)"        },
 };
 
@@ -2587,6 +2588,47 @@ static std::set<llm_tensor> llm_get_tensor_names(llm_arch arch) {
                 LLM_TENSOR_NEXTN_ENORM,
                 LLM_TENSOR_NEXTN_HNORM,
                 LLM_TENSOR_NEXTN_SHARED_HEAD_NORM,
+            };
+        // GLM-5.3's MTP module lifted out into a standalone speculative draft. One MLA+DSA
+        // layer plus the 144-expert MoE - no KDA, and no hyper-connections, because blk.45
+        // carries no hc_* tensors and uses plain pre-norm residuals. The shared head norm is
+        // written as OUTPUT_NORM by the converter, since in a standalone model that is exactly
+        // the role it plays.
+        case LLM_ARCH_GLM5_NEXT_MTP:
+            return {
+                LLM_TENSOR_TOKEN_EMBD,
+                LLM_TENSOR_OUTPUT_NORM,
+                LLM_TENSOR_OUTPUT,
+                LLM_TENSOR_ATTN_NORM,
+                LLM_TENSOR_FFN_NORM,
+                LLM_TENSOR_ATTN_OUT,
+                LLM_TENSOR_ATTN_Q_A,
+                LLM_TENSOR_ATTN_Q_B,
+                LLM_TENSOR_ATTN_Q_A_NORM,
+                LLM_TENSOR_ATTN_KV_A_MQA,
+                LLM_TENSOR_ATTN_KV_A_NORM,
+                LLM_TENSOR_ATTN_KV_B,
+                LLM_TENSOR_ATTN_K_B,
+                LLM_TENSOR_ATTN_V_B,
+                LLM_TENSOR_INDEXER_K_NORM,
+                LLM_TENSOR_INDEXER_PROJ,
+                LLM_TENSOR_INDEXER_ATTN_K,
+                LLM_TENSOR_INDEXER_ATTN_Q_B,
+                LLM_TENSOR_INDEXER_KPOOL_APE,
+                LLM_TENSOR_INDEXER_KPOOL_GATE,
+                LLM_TENSOR_FFN_GATE_INP,
+                LLM_TENSOR_FFN_GATE_EXPS,
+                LLM_TENSOR_FFN_DOWN_EXPS,
+                LLM_TENSOR_FFN_UP_EXPS,
+                LLM_TENSOR_FFN_EXP_PROBS_B,
+                LLM_TENSOR_FFN_GATE_SHEXP,
+                LLM_TENSOR_FFN_DOWN_SHEXP,
+                LLM_TENSOR_FFN_UP_SHEXP,
+                // The MTP entry point: enorm on the token embedding, hnorm on the incoming
+                // hidden state, concatenated and projected back down to n_embd.
+                LLM_TENSOR_NEXTN_EH_PROJ,
+                LLM_TENSOR_NEXTN_ENORM,
+                LLM_TENSOR_NEXTN_HNORM,
             };
         case LLM_ARCH_KIMI_LINEAR:
             return {

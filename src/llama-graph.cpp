@@ -96,6 +96,39 @@ bool llm_graph_input_embd::can_reuse(const llm_graph_params & params) {
     return res;
 }
 
+void llm_graph_input_mtp_hidden::set_input(const llama_ubatch * ubatch) {
+    const int64_t n_tokens = ubatch->n_tokens;
+
+    // The caller supplies one hidden state per token in the batch it is about to decode. If the
+    // batch were split into several ubatches these rows would no longer line up, so the draft
+    // context is created with n_ubatch == n_batch and the mismatch is a hard error rather than
+    // a silent misalignment - drafting from the wrong hidden state degrades acceptance in a way
+    // that looks like a bad head rather than a bug.
+    GGML_ASSERT(src != nullptr && "llama_set_mtp_hidden() must be called before llama_decode()");
+    GGML_ASSERT(h_prev->ne[0] == n_embd);
+
+    ggml_backend_tensor_set(h_prev, src, 0, n_tokens*n_embd*ggml_element_size(h_prev));
+
+    // The reference zeroes the token embedding at absolute position 0, where there is no
+    // preceding token for the module to condition on
+    // (glm4_moe_mtp.py: torch.where(positions == 0, 0, inputs_embeds)).
+    //
+    // It is built here from ubatch->pos rather than derived in the graph from inp_pos: doing it
+    // in-graph needs an I32->F32 ggml_cast, which not every backend implements, and this costs
+    // one float per token.
+    if (emask && ubatch->pos) {
+        std::vector<float> keep(n_tokens);
+        for (int64_t i = 0; i < n_tokens; ++i) {
+            keep[i] = ubatch->pos[i] == 0 ? 0.0f : 1.0f;
+        }
+        ggml_backend_tensor_set(emask, keep.data(), 0, n_tokens*ggml_element_size(emask));
+    }
+}
+
+bool llm_graph_input_mtp_hidden::can_reuse(const llm_graph_params & params) {
+    return h_prev && h_prev->ne[1] == params.ubatch.n_tokens;
+}
+
 void llm_graph_input_pos::set_input(const llama_ubatch * ubatch) {
     if (ubatch->pos && pos) {
         const int64_t n_tokens = ubatch->n_tokens;
@@ -1695,6 +1728,24 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {
     ggml_build_forward_expand(gf, cur);
 
     return cur;
+}
+
+llm_graph_input_mtp_hidden * llm_graph_context::build_inp_mtp_hidden() const {
+    auto inp = std::make_unique<llm_graph_input_mtp_hidden>(hparams.n_embd, cparams.mtp_h_prev);
+
+    inp->h_prev = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd, ubatch.n_tokens);
+    ggml_set_input(inp->h_prev);
+    cb(inp->h_prev, "inp_mtp_hidden", -1);
+
+    inp->emask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 1, ubatch.n_tokens);
+    ggml_set_input(inp->emask);
+    cb(inp->emask, "inp_mtp_emask", -1);
+
+    auto * res_inp = inp.get();
+
+    res->add_input(std::move(inp));
+
+    return res_inp;
 }
 
 ggml_tensor * llm_graph_context::build_inp_pos() const {
