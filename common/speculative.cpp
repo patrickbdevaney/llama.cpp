@@ -21,6 +21,7 @@ const std::vector<enum common_speculative_type> common_speculative_types = {
     COMMON_SPECULATIVE_TYPE_NONE,
     COMMON_SPECULATIVE_TYPE_DRAFT,
     COMMON_SPECULATIVE_TYPE_EAGLE3,
+    COMMON_SPECULATIVE_TYPE_MTP,
     COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE,
     COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K,
     COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V,
@@ -32,6 +33,7 @@ const std::map<std::string, enum common_speculative_type> common_speculative_typ
     {"none",          COMMON_SPECULATIVE_TYPE_NONE},
     {"draft",         COMMON_SPECULATIVE_TYPE_DRAFT},
     {"eagle3",        COMMON_SPECULATIVE_TYPE_EAGLE3},
+    {"mtp",           COMMON_SPECULATIVE_TYPE_MTP},
     {"ngram_simple",  COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE},
     {"ngram_map_k",   COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K},
     {"ngram_map_k4v", COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V},
@@ -142,6 +144,11 @@ struct common_speculative_state {
             llama_tokens & result) = 0;
 
     virtual void accept(uint16_t n_accepted) = 0;
+
+    // Hidden-state speculators (MTP, EAGLE) need to know which target output row belongs to the
+    // token preceding id_last; it is the count of draft tokens the target just accepted. Nothing
+    // else uses it, so the default is to ignore it.
+    virtual void set_target_output_idx(int32_t i) { GGML_UNUSED(i); }
 };
 
 struct common_speculative_state_draft : public common_speculative_state {
@@ -462,6 +469,241 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
     }
 };
 
+
+// Is this draft model GLM-5.3's native MTP module, repackaged by scripts/make_mtp_draft.py?
+static bool common_speculative_is_mtp(const llama_model * model_dft) {
+    if (!model_dft) {
+        return false;
+    }
+
+    char buf[64] = {0};
+    const int32_t n = llama_model_meta_val_str(model_dft, "general.architecture", buf, sizeof(buf));
+
+    return n > 0 && strcmp(buf, "glm5-next-mtp") == 0;
+}
+
+// Speculative decoding with a Multi-Token Prediction head.
+//
+// Unlike a draft model, an MTP module is not a small language model: it cannot predict anything
+// on its own. Every step it consumes the hidden state that the *target* produced for the
+// preceding token, so the two models are coupled at every decode rather than merely agreeing on
+// a vocabulary. That coupling is the whole reason it drafts well from a single layer - the
+// target's 45 layers have already encoded the context into the vector it is handed.
+//
+// Reference: vllm/model_executor/models/glm4_moe_mtp.py.
+//
+// Two consequences shape the code below:
+//
+//   * The draft's own KV cache holds only the tokens this speculator has itself decoded. Hidden
+//     states for the prompt were never computed - the target emits one only for the position it
+//     was asked to output - so there is nothing to seed them with. This costs less than it
+//     sounds: GLM-5.3's MLA is NoPE, so a gap in the cache is not a positional inconsistency,
+//     merely fewer keys, and the context the module actually relies on arrives through h_prev.
+//
+//   * At depth > 1 the module feeds on its OWN output rather than the target's. That output is
+//     the pre-shared_head_norm tensor, which is why the draft graph exposes it as t_embd; using
+//     the post-norm value would silently degrade every draft past the first.
+struct common_speculative_state_mtp : public common_speculative_state {
+    llama_context * ctx_tgt;
+    llama_context * ctx_dft;
+
+    common_sampler * smpl;
+    llama_batch      batch;
+
+    // Number of cells the draft KV holds that the target has committed to. Everything at or
+    // after this position is last round's speculation and is dropped before drafting again.
+    int32_t n_dft = 0;
+
+    // Which target output row carries the hidden state for the token preceding id_last. The
+    // caller knows it (it is the number of draft tokens the target accepted); -1 means "the
+    // last row", which is the right answer both on the first call and when every draft was
+    // accepted.
+    int32_t tgt_out_idx = -1;
+
+    std::vector<float> h_buf;
+
+    // Whether h_buf holds the hidden state for the current round. It is filled in
+    // set_target_output_idx() rather than here in draft(), because the target's embeddings buffer
+    // does not survive until drafting: on a hybrid target the accepted tokens are replayed on
+    // ctx_tgt in between (see common_spec_rollback), which overwrites it. Reading it late would
+    // hand the draft head a hidden state from the replay batch instead of the verification batch.
+    bool h_valid = false;
+
+    common_speculative_state_mtp(
+            enum common_speculative_type type,
+            llama_context * ctx_tgt,
+            llama_context * ctx_dft)
+        : common_speculative_state(type)
+        , ctx_tgt(ctx_tgt)
+        , ctx_dft(ctx_dft)
+    {
+        batch = llama_batch_init(llama_n_batch(ctx_dft), 0, 1);
+
+        {
+            common_params_sampling sparams;
+            sparams.no_perf = false;
+            sparams.top_k   = 10;
+            sparams.samplers = { COMMON_SAMPLER_TYPE_TOP_K };
+
+            smpl = common_sampler_init(llama_get_model(ctx_dft), sparams);
+        }
+
+        // Both contexts must hand back hidden states: the target's feeds depth 1, the draft's
+        // feeds every depth after that. llama.cpp extracts embeddings together with logits, so
+        // this costs an n_embd-sized row per output and nothing else.
+        llama_set_embeddings(ctx_tgt, true);
+        llama_set_embeddings(ctx_dft, true);
+
+        // Without this, turning embeddings on would promote every prompt token to an output and
+        // allocate a full logits row for each. We only ever read the hidden state of tokens the
+        // caller already wanted logits for, so ask for exactly that.
+        llama_set_embeddings_outputs_only(ctx_tgt, true);
+        llama_set_embeddings_outputs_only(ctx_dft, true);
+
+        h_buf.resize(llama_model_n_embd(llama_get_model(ctx_dft)));
+    }
+
+    ~common_speculative_state_mtp() override {
+        common_sampler_free(smpl);
+        llama_batch_free(batch);
+    }
+
+    void begin(const llama_tokens & prompt) override {
+        GGML_UNUSED(prompt);
+
+        // A new generation shares nothing with the previous one.
+        llama_memory_clear(llama_get_memory(ctx_dft), false);
+        n_dft       = 0;
+        tgt_out_idx = -1;
+        h_valid     = false;
+    }
+
+    void draft(
+            const common_params_speculative & params,
+            const llama_tokens & prompt_tgt,
+            llama_token id_last,
+            llama_tokens & result) override {
+        GGML_UNUSED(prompt_tgt);
+
+        result.clear();
+        result.reserve(params.n_max);
+
+        const int n_embd = (int) h_buf.size();
+
+        // Normally set_target_output_idx() has already captured this. It has not on the first
+        // draft of a sequence, where the caller has decoded the prompt and never accepted
+        // anything, so fall back to reading the target's last output row.
+        if (!h_valid) {
+            const float * h_tgt = llama_get_embeddings_ith(ctx_tgt, tgt_out_idx);
+            if (h_tgt == nullptr) {
+                // No hidden state means no draft. Returning empty is not a failure: the caller
+                // simply decodes one token the ordinary way, which is strictly better than
+                // drafting from a stale or zeroed vector and having the target reject it.
+                LOG_DBG("%s: target hidden state unavailable (row %d) - skipping this draft\n",
+                        __func__, tgt_out_idx);
+                return;
+            }
+            std::copy(h_tgt, h_tgt + n_embd, h_buf.begin());
+        }
+
+        // h_buf is overwritten with draft-side hidden states below, so it must be re-captured
+        // before the next round.
+        h_valid = false;
+
+        // Drop last round's speculation, keeping the cells the target committed to.
+        auto * mem_dft = llama_get_memory(ctx_dft);
+        llama_memory_seq_rm(mem_dft, 0, n_dft, -1);
+
+        // Take the write position from the cache rather than from n_dft. The two should agree,
+        // but a counter that drifts by one produces "sequence positions must remain consecutive"
+        // on the *next* call, at which point the cause is several decodes behind the symptom -
+        // and every subsequent draft fails the same way, so a single slip silently turns
+        // speculation off for the rest of the generation. Asking the memory module what it
+        // actually holds cannot drift.
+        const llama_pos pos_max = llama_memory_seq_pos_max(mem_dft, 0);
+
+        common_sampler_reset(smpl);
+
+        llama_token tok = id_last;
+        int32_t     pos = pos_max + 1;   // pos_max is -1 on an empty cache, so this starts at 0
+        int         n_decoded = 0;
+
+        for (int i = 0; i < params.n_max; ++i) {
+            llama_set_mtp_hidden(ctx_dft, h_buf.data(), 1);
+
+            common_batch_clear(batch);
+            common_batch_add  (batch, tok, pos, { 0 }, true);
+
+            if (llama_decode(ctx_dft, batch) != 0) {
+                // Leave nothing half-written behind: a failed decode that still advanced our
+                // bookkeeping would desynchronise every later call. Start the draft cache over
+                // instead - it costs this generation's accumulated MTP context and nothing else.
+                LOG_ERR("%s: draft decode failed at depth %d (pos %d) - resetting draft cache\n",
+                        __func__, i, pos);
+                llama_memory_clear(mem_dft, false);
+                n_dft = 0;
+                return;
+            }
+
+            n_decoded++;
+
+            common_sampler_sample(smpl, ctx_dft, 0, true);
+
+            const auto * cur_p = common_sampler_get_candidates(smpl, true);
+            const llama_token id = cur_p->data[0].id;
+
+            common_sampler_accept(smpl, id, true);
+            result.push_back(id);
+
+            if ((int) result.size() >= params.n_max) {
+                break;
+            }
+
+            // Drafting is only worth the decode if the module is confident; the target pays for
+            // every token it has to reject.
+            if (cur_p->data[0].p < params.p_min) {
+                break;
+            }
+
+            // Depth > 1 conditions on the module's own output. See the note above on why this
+            // is the pre-norm tensor.
+            const float * h_dft = llama_get_embeddings_ith(ctx_dft, -1);
+            if (h_dft == nullptr) {
+                break;
+            }
+            std::copy(h_dft, h_dft + n_embd, h_buf.begin());
+
+            tok = id;
+            pos++;
+        }
+
+        // The position of id_last is now committed; everything drafted after it is provisional
+        // until accept() tells us how much the target kept. If nothing was decoded there is
+        // nothing to commit.
+        if (n_decoded > 0) {
+            n_dft = pos_max + 2;
+        }
+    }
+
+    void accept(uint16_t n_accepted) override {
+        // Draft tokens the target agreed with keep their draft-side KV cells.
+        n_dft += n_accepted;
+    }
+
+    void set_target_output_idx(int32_t i) override {
+        tgt_out_idx = i;
+
+        const float * h_tgt = llama_get_embeddings_ith(ctx_tgt, i);
+        if (h_tgt == nullptr) {
+            h_valid = false;
+            return;
+        }
+
+        std::copy(h_tgt, h_tgt + h_buf.size(), h_buf.begin());
+        h_valid = true;
+    }
+};
+
 // state of self-speculation (simple implementation, not ngram-map)
 struct common_speculative_state_ngram_simple : public common_speculative_state {
     common_ngram_simple_config config;
@@ -737,9 +979,183 @@ struct common_speculative_state_ngram_cache : public common_speculative_state {
     }
 };
 
+
+//
+// recurrent-state rollback
+//
+
+// Speculative decoding rejects a drafted token by removing it from the target's memory. A model
+// whose layers carry a rolling recurrent state cannot do that: the state summarises every token
+// seen so far and has no per-token history to rewind to, so llama_memory_recurrent::seq_rm refuses
+// any partial removal that touches the final position. That is not a corner case for GLM-5.3 -
+// 34 of its 45 layers are KDA linear attention - and it makes speculation impossible for the whole
+// hybrid family (Mamba, Jamba, Falcon-H1, Granite-4, ...) no matter how good the draft is.
+//
+// The way through is to checkpoint the recurrent state before the verification batch and, when
+// some drafted tokens turn out to be wrong, restore it and replay the ones that were right. Three
+// things keep this cheap:
+//
+//   - LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY saves the recurrent half only. Its size is fixed by the
+//     model (145 MiB for GLM-5.3-Flash: 9.6 MiB of conv state, 136 MiB of delta-net state), not by
+//     the context length, so the cost does not grow as the conversation does. The attention KV
+//     needs no checkpoint - it rewinds the ordinary way.
+//   - Restoring puts the recurrent cell's final position back at pos_start - 1, which makes the
+//     ordinary seq_rm legal again: nothing the cell holds is inside the removed range any more.
+//     So the attention half is truncated by the very call the caller was already making, and no
+//     call site has to learn about any of this.
+//   - The replay is skipped entirely when every drafted token is accepted, which is the case that
+//     matters most for throughput.
+//
+// What it costs is one extra forward pass over the accepted tokens on a partial rejection. That is
+// the honest price of the architecture; a future refinement could fold those tokens into the next
+// verification batch instead of paying for a pass of their own.
+struct common_spec_rollback {
+    llama_context * ctx    = nullptr;
+    llama_seq_id    seq_id = 0;
+
+    std::vector<uint8_t> buf;
+
+    llama_pos    pos_start = -1;  // position of the first token of the verification batch
+    llama_tokens fed;             // what was fed there: id_last followed by the draft
+    bool         armed     = false;
+
+    // Number of tokens waiting to be replayed onto the restored state, or 0 for none. The restore
+    // itself is done as soon as the rejection is known, but the replay is a decode, and a decode
+    // overwrites the context's output buffer. With more than one sequence in flight the caller is
+    // still sampling other sequences out of that buffer at this point, so the decode has to wait
+    // until it is asked for - see common_speculative_flush_rollback().
+    int32_t      n_pending = 0;
+
+    llama_batch batch;
+
+    common_spec_rollback(llama_context * ctx, llama_seq_id seq_id, int32_t n_batch)
+        : ctx(ctx), seq_id(seq_id), batch(llama_batch_init(n_batch, 0, 1)) {}
+
+    ~common_spec_rollback() {
+        llama_batch_free(batch);
+    }
+};
+
+// Take the checkpoint. Called with the target's memory holding exactly the committed prefix, i.e.
+// right before the caller builds the batch of id_last + draft.
+static void common_spec_rollback_save(
+        common_spec_rollback * rb,
+        llama_token            id_last,
+        const llama_tokens   & draft) {
+    rb->armed = false;
+
+    const size_t n = llama_state_seq_get_size_ext(rb->ctx, rb->seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+    if (n == 0) {
+        LOG_WRN("%s: the target has no recurrent state to checkpoint\n", __func__);
+        return;
+    }
+
+    if (rb->buf.size() < n) {
+        rb->buf.resize(n);
+    }
+
+    if (llama_state_seq_get_data_ext(rb->ctx, rb->buf.data(), rb->buf.size(), rb->seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
+        LOG_WRN("%s: failed to checkpoint the recurrent state\n", __func__);
+        return;
+    }
+
+    // Take the write position from the memory rather than from the caller's token count. The two
+    // agree, but only the memory is authoritative about where the next token actually lands.
+    rb->pos_start = llama_memory_seq_pos_max(llama_get_memory(rb->ctx), rb->seq_id) + 1;
+
+    rb->fed.clear();
+    rb->fed.reserve(1 + draft.size());
+    rb->fed.push_back(id_last);
+    rb->fed.insert(rb->fed.end(), draft.begin(), draft.end());
+
+    rb->armed = true;
+}
+
+// Put the sequence back to the accepted prefix. n_accepted is the number of DRAFTED tokens the
+// target agreed with, so the batch keeps n_accepted + 1 of the tokens it was given. Returns false
+// if the sequence could not be restored, in which case speculation must stop - carrying on against
+// a recurrent state that no longer matches the tokens would corrupt the output silently.
+static bool common_spec_rollback_apply(common_spec_rollback * rb, int32_t n_accepted) {
+    if (!rb->armed) {
+        return true;
+    }
+
+    rb->armed = false;
+
+    const int32_t n_keep = n_accepted + 1;
+
+    // Nothing was rejected: the state already covers exactly the tokens that were kept.
+    if (n_keep >= (int32_t) rb->fed.size()) {
+        return true;
+    }
+
+    if (llama_state_seq_set_data_ext(rb->ctx, rb->buf.data(), rb->buf.size(), rb->seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
+        LOG_ERR("%s: failed to restore the recurrent state\n", __func__);
+        return false;
+    }
+
+    // Legal now that the recurrent half is back at pos_start - 1; this truncates the attention KV.
+    if (!llama_memory_seq_rm(llama_get_memory(rb->ctx), rb->seq_id, rb->pos_start, -1)) {
+        LOG_ERR("%s: failed to truncate the memory after restoring the recurrent state\n", __func__);
+        return false;
+    }
+
+    rb->n_pending = n_keep;
+
+    LOG_DBG("%s: rolled back to pos %d, %d token(s) queued for replay\n", __func__, rb->pos_start, n_keep);
+
+    return true;
+}
+
+// Replay the accepted tokens onto the restored state. Must run before anything else touches the
+// sequence, and only once the caller has finished reading logits out of the context.
+static bool common_spec_rollback_flush(common_spec_rollback * rb) {
+    if (rb->n_pending == 0) {
+        return true;
+    }
+
+    const int32_t n_keep = rb->n_pending;
+    rb->n_pending = 0;
+
+    // Between the restore and here the caller may have thrown the sequence away entirely - the
+    // server does exactly that when it releases a child task's slot. Replaying onto a sequence
+    // that no longer ends where the checkpoint left it would punch a hole in it, so check that it
+    // is still the sequence we rolled back before writing to it.
+    const llama_pos pos_cur = llama_memory_seq_pos_max(llama_get_memory(rb->ctx), rb->seq_id) + 1;
+    if (pos_cur != rb->pos_start) {
+        LOG_DBG("%s: sequence moved to pos %d since the rollback to %d - dropping the replay\n",
+                __func__, pos_cur, rb->pos_start);
+        return true;
+    }
+
+    common_batch_clear(rb->batch);
+    for (int32_t i = 0; i < n_keep; ++i) {
+        // Ask for logits on the last row only. They are discarded - the caller sampled from the
+        // verification batch - but a batch that requests no outputs at all is not a shape every
+        // path expects, and one row is nothing.
+        common_batch_add(rb->batch, rb->fed[i], rb->pos_start + i, { rb->seq_id }, i == n_keep - 1);
+    }
+
+    if (llama_decode(rb->ctx, rb->batch) != 0) {
+        LOG_ERR("%s: failed to replay %d accepted tokens\n", __func__, n_keep);
+        return false;
+    }
+
+    LOG_DBG("%s: replayed %d token(s) from pos %d\n", __func__, n_keep, rb->pos_start);
+
+    return true;
+}
+
 struct common_speculative {
     std::vector<std::unique_ptr<common_speculative_state>> impls; // list of implementations to use and their states
     common_speculative_state * curr_impl = nullptr; // current implementation in use (for stats)
+
+    // Set only when the target's memory cannot drop rejected tokens on its own.
+    std::unique_ptr<common_spec_rollback> rb;
+
+    // Latched if a rollback ever fails. Speculation stays off for the rest of the run rather than
+    // producing tokens verified against a state that has drifted from the sequence.
+    bool broken = false;
 };
 
 static common_ngram_map get_common_ngram_map(const common_speculative_config & config) {
@@ -781,6 +1197,7 @@ std::string common_speculative_type_to_str(enum common_speculative_type type) {
         case COMMON_SPECULATIVE_TYPE_NONE:          return "none";
         case COMMON_SPECULATIVE_TYPE_DRAFT:         return "draft";
         case COMMON_SPECULATIVE_TYPE_EAGLE3:        return "eagle3";
+        case COMMON_SPECULATIVE_TYPE_MTP:           return "mtp";
         case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE:  return "ngram_simple";
         case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K:   return "ngram_map_k";
         case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V: return "ngram_map_k4v";
@@ -822,9 +1239,18 @@ bool common_speculative_is_compat(llama_context * ctx_tgt) {
 
     // try to remove the last tokens
     if (!llama_memory_seq_rm(mem, 0, 1, -1)) {
-        LOG_WRN("%s: the target context does not support partial sequence removal\n", __func__);
-        res = false;
-        goto done;
+        // A recurrent or hybrid target refuses this: its rolling state cannot be rewound by a
+        // token. That used to be the end of the matter, but it is recoverable - the state can be
+        // checkpointed before the verification batch and the accepted tokens replayed onto it.
+        // See common_spec_rollback; common_speculative_init arms it for exactly these models.
+        if (!llama_model_is_recurrent(llama_get_model(ctx_tgt)) && !llama_model_is_hybrid(llama_get_model(ctx_tgt))) {
+            LOG_WRN("%s: the target context does not support partial sequence removal\n", __func__);
+            res = false;
+            goto done;
+        }
+
+        LOG_INF("%s: the target cannot drop rejected tokens directly - speculation will checkpoint "
+                "and replay its recurrent state\n", __func__);
     }
 
 done:
@@ -838,7 +1264,8 @@ done:
 //
 common_speculative * common_speculative_init(
         common_params_speculative & params,
-        llama_context             * ctx_tgt) {
+        llama_context             * ctx_tgt,
+        llama_seq_id                seq_id_tgt) {
     llama_context * ctx_dft = nullptr;
     if (params.model_dft) {
         ctx_dft = llama_init_from_model(params.model_dft, params.cparams_dft);
@@ -853,6 +1280,15 @@ common_speculative * common_speculative_init(
     {
         bool has_draft = !params.mparams_dft.path.empty();
         bool has_draft_eagle3 = false; // TODO PR-18039: if params.speculative.eagle3
+
+        // A GLM-5.3 MTP draft announces itself through its architecture, so -md is all
+        // the user has to pass. Treating it as an ordinary draft model would run it
+        // without hidden states and produce noise, so this is a redirect, not an option.
+        bool has_mtp = has_draft && common_speculative_is_mtp(params.model_dft);
+        if (has_mtp) {
+            has_draft = false;
+            LOG_INF("%s: draft model is a GLM-5.3 MTP module - using hidden-state speculation\n", __func__);
+        }
 
         bool has_ngram_cache   = (params.type == COMMON_SPECULATIVE_TYPE_NGRAM_CACHE);
         bool has_ngram_simple  = (params.type == COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE);
@@ -898,6 +1334,9 @@ common_speculative * common_speculative_init(
         if (has_draft_eagle3) {
             configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_EAGLE3, params));
         }
+        if (has_mtp) {
+            configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_MTP, params));
+        }
     }
 
     std::vector<std::unique_ptr<common_speculative_state>> impls = {};
@@ -917,6 +1356,13 @@ common_speculative * common_speculative_init(
             }
             case COMMON_SPECULATIVE_TYPE_EAGLE3: {
                 impls.push_back(std::make_unique<common_speculative_state_eagle3>(config.type));
+                break;
+            }
+            case COMMON_SPECULATIVE_TYPE_MTP: {
+                impls.push_back(std::make_unique<common_speculative_state_mtp>(config.type,
+                    /* .ctx_tgt = */ ctx_tgt,
+                    /* .ctx_dft = */ ctx_dft
+                ));
                 break;
             }
             case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE: {
@@ -965,9 +1411,24 @@ common_speculative * common_speculative_init(
         return nullptr;
     }
 
-    auto * result = new common_speculative {
-        /* .impls = */ std::move(impls)
-    };
+    auto * result = new common_speculative();
+
+    result->impls = std::move(impls);
+
+    // Arm the recurrent-state rollback for targets whose memory cannot drop rejected tokens. The
+    // test is on the model rather than on a decode probe: common_speculative_is_compat() has
+    // already paid for the probe, and repeating it here would clear the caller's memory.
+    {
+        const llama_model * model_tgt = llama_get_model(ctx_tgt);
+
+        if (llama_model_is_recurrent(model_tgt) || llama_model_is_hybrid(model_tgt)) {
+            result->rb = std::make_unique<common_spec_rollback>(ctx_tgt, seq_id_tgt, (int32_t) llama_n_batch(ctx_tgt));
+
+            LOG_INF("%s: recurrent-state rollback enabled for seq %d (checkpoint %.2f MiB)\n", __func__,
+                    seq_id_tgt,
+                    llama_state_seq_get_size_ext(ctx_tgt, seq_id_tgt, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY)/1024.0/1024.0);
+        }
+    }
 
     return result;
 }
@@ -1001,6 +1462,14 @@ llama_tokens common_speculative_draft(
 
     spec->curr_impl = nullptr; // reset current implementation
 
+    if (spec->broken) {
+        return result;
+    }
+
+    // Safety net for a caller that does not flush on its own: the checkpoint below reads the
+    // target's write position, and that is only right once the replay has landed.
+    common_speculative_flush_rollback(spec);
+
     for (auto & impl : spec->impls) {
         {
             common_time_meas tm(impl->t_draft_us, !impl->gen_perf);
@@ -1021,7 +1490,58 @@ llama_tokens common_speculative_draft(
         }
     }
 
+    // Drop a draft too short to be worth verifying. Both callers already do this on their side,
+    // but deciding it here as well is what keeps the checkpoint below in step with what the target
+    // is actually fed - a draft discarded after the checkpoint was taken would leave the rollback
+    // expecting tokens that never reached the batch.
+    if ((int) result.size() < params.n_min) {
+        result.clear();
+    }
+
+    // The target's memory holds nothing but the committed prefix at this moment, which is the only
+    // point at which the checkpoint is worth taking.
+    if (spec->rb) {
+        if (result.empty()) {
+            // Nothing drafted means nothing can be rejected. Disarm rather than leave the previous
+            // round's checkpoint armed, which would make the next rollback restore to a stale
+            // position.
+            spec->rb->armed = false;
+        } else {
+            common_spec_rollback_save(spec->rb.get(), id_last, result);
+        }
+    }
+
     return result;
+}
+
+void common_speculative_set_target_output_idx(common_speculative * spec, int32_t i) {
+    if (spec == nullptr) {
+        return;
+    }
+
+    // Applies to whichever implementation is live; the others ignore it.
+    for (const auto & impl : spec->impls) {
+        impl->set_target_output_idx(i);
+    }
+
+    // i is also the number of drafted tokens the target accepted, which is all the rollback needs
+    // to know. It has to run after the implementations, not before: the MTP implementation reads
+    // the target's hidden state in the call above, and the replay overwrites it.
+    if (spec->rb && !common_spec_rollback_apply(spec->rb.get(), i)) {
+        LOG_ERR("%s: recurrent-state rollback failed - disabling speculative decoding\n", __func__);
+        spec->broken = true;
+    }
+}
+
+void common_speculative_flush_rollback(common_speculative * spec) {
+    if (spec == nullptr || spec->rb == nullptr || spec->broken) {
+        return;
+    }
+
+    if (!common_spec_rollback_flush(spec->rb.get())) {
+        LOG_ERR("%s: recurrent-state replay failed - disabling speculative decoding\n", __func__);
+        spec->broken = true;
+    }
 }
 
 void common_speculative_accept(common_speculative * spec, uint16_t n_accepted) {

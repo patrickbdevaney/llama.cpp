@@ -782,7 +782,7 @@ private:
 
             // try speculative decoding
             if (can_spec) {
-                slot.spec = common_speculative_init(params_base.speculative, slot.ctx);
+                slot.spec = common_speculative_init(params_base.speculative, slot.ctx, slot.id);
                 if (slot.spec) {
                     if (mctx) {
                         SRV_ERR("%s\n", "speculative decoding is not supported with multimodal");
@@ -2925,6 +2925,7 @@ private:
                 slot.n_draft_accepted += ids.size() - 1;
 
                 // inform the speculative decoding about the number of accepted tokens
+                common_speculative_set_target_output_idx(slot.spec, (int32_t) ids.size() - 1);
                 common_speculative_accept(slot.spec, ids.size() - 1);
 
                 // rollback to the state before sampling the draft tokens
@@ -2956,6 +2957,15 @@ private:
                 }
 
                 SLT_DBG(slot, "accepted %d/%d draft tokens, new n_tokens = %d\n", (int) ids.size() - 1, (int) n_draft, slot.prompt.n_tokens());
+            }
+
+            // A target that cannot drop rejected tokens by itself - any recurrent or hybrid model -
+            // has had its state restored above but not yet replayed onto, because replaying is a
+            // decode and a decode would have overwritten the logits the loop above was still
+            // sampling other slots from. Every slot is done reading now, so finish the job here
+            // rather than leaving a sequence whose memory is shorter than its token list.
+            for (auto & slot : slots) {
+                common_speculative_flush_rollback(slot.spec);
             }
         }
 

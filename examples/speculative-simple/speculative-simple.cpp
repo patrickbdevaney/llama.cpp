@@ -122,6 +122,21 @@ int main(int argc, char ** argv) {
     struct common_sampler * smpl = common_sampler_init(model_tgt, params.sampling);
 
     // eval the prompt
+    // Not every target can be speculated against. Rejecting a drafted token means removing it from
+    // the KV cache, and a recurrent (linear-attention) layer has no way to rewind its state to an
+    // earlier position - llama_memory_recurrent::seq_rm refuses a partial removal that touches the
+    // final position. For those models common_speculative_init arms a checkpoint of the recurrent
+    // state instead, and this check passes; it still fails for a target that can do neither.
+    //
+    // The check has to be here rather than further down: without it the run does not fail, it
+    // lies. llama_decode returns -1, nobody looks, and generation continues from stale logits,
+    // reporting an acceptance rate for tokens it never really verified.
+    if (!common_speculative_is_compat(ctx_tgt)) {
+        LOG_ERR("%s: the target model does not support speculative decoding - its memory module "
+                "cannot roll back rejected tokens (typical of hybrid/recurrent architectures)\n", __func__);
+        return 1;
+    }
+
     llama_decode(ctx_tgt, llama_batch_get_one(inp.data(), inp.size() - 1));
 
     // note: keep the last token separate!
@@ -186,6 +201,14 @@ int main(int argc, char ** argv) {
         // disagrees with the draft
         //
         const auto ids = common_sampler_sample_and_accept_n(smpl, ctx_tgt, draft);
+
+        // The hidden state an MTP draft needs next is the one at the row of the last accepted
+        // token, which is exactly ids.size() - 1. Other speculative types ignore this.
+        common_speculative_set_target_output_idx(spec, (int32_t) ids.size() - 1);
+
+        // Only one sequence here, so nothing else is waiting to read logits: the rollback of a
+        // hybrid target can be finished immediately. (No-op for targets that do not need one.)
+        common_speculative_flush_rollback(spec);
 
         //LOG_DBG("ids: %s\n", string_from(ctx_tgt, ids).c_str());
 
