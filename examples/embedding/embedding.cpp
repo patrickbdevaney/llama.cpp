@@ -286,6 +286,56 @@ int main(int argc, char ** argv) {
     float * out = emb + e * n_embd_out;
     batch_decode(ctx, batch, out, s, n_embd_out, params.embd_normalize);
 
+    // Raw fp16 dump for draft-head distillation. JSON of 4096 floats/token costs ~6x the
+    // bytes of the fp16 it encodes, which is untenable across a multi-day extraction.
+    // Driven by an env var so the shared arg parser stays untouched.
+    if (const char * bin_path = getenv("LLAMA_EMBD_BIN")) {
+        FILE * bf = fopen(bin_path, "wb");
+        if (bf == NULL) {
+            LOG_ERR("%s: could not open LLAMA_EMBD_BIN=%s\n", __func__, bin_path);
+        } else {
+            const int64_t nrow = (pooling_type == LLAMA_POOLING_TYPE_NONE) ? n_embd_count : n_prompts;
+            std::vector<ggml_fp16_t> row(n_embd_out);
+            for (int64_t j = 0; j < nrow; j++) {
+                ggml_fp32_to_fp16_row(emb + j*n_embd_out, row.data(), n_embd_out);
+                fwrite(row.data(), sizeof(ggml_fp16_t), n_embd_out, bf);
+            }
+            fclose(bf);
+            LOG_INF("%s: wrote %lld x %d fp16 to %s\n", __func__, (long long) nrow, n_embd_out, bin_path);
+        }
+    }
+
+    // Companion token dump. The whole point of the trace is that row i is the hidden state
+    // OF token i, so the targets have to be the ids this binary actually tokenized - not a
+    // re-tokenization done elsewhere that can drift by a token here and there. Writing them
+    // from inside the same process makes the alignment true by construction instead of an
+    // assertion we hope holds.
+    if (const char * bin_path = getenv("LLAMA_EMBD_BIN")) {
+        if (pooling_type == LLAMA_POOLING_TYPE_NONE) {
+            const std::string ids_path  = std::string(bin_path) + ".ids";
+            const std::string lens_path = std::string(bin_path) + ".lens";
+            FILE * idf = fopen(ids_path.c_str(),  "wb");
+            FILE * lnf = fopen(lens_path.c_str(), "wb");
+            if (idf == NULL || lnf == NULL) {
+                LOG_ERR("%s: could not open %s / %s\n", __func__, ids_path.c_str(), lens_path.c_str());
+            } else {
+                int64_t ntok = 0;
+                for (int k = 0; k < n_prompts; k++) {
+                    const int32_t len = (int32_t) inputs[k].size();
+                    fwrite(&len, sizeof(int32_t), 1, lnf);
+                    for (int32_t j = 0; j < len; j++) {
+                        const int32_t id = (int32_t) inputs[k][j];
+                        fwrite(&id, sizeof(int32_t), 1, idf);
+                    }
+                    ntok += len;
+                }
+                LOG_INF("%s: wrote %lld ids over %d seqs to %s\n", __func__, (long long) ntok, n_prompts, ids_path.c_str());
+            }
+            if (idf) fclose(idf);
+            if (lnf) fclose(lnf);
+        }
+    }
+
     if (params.embd_out.empty()) {
         LOG("\n");
 
