@@ -1097,6 +1097,16 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
             metadata[i].target_type = tensor->type;
         }
 
+        // DeepSeek-V4.1 hyper-connection mixers feed a sinkhorn normalisation whose error compounds
+        // over 40 layers x 2 sublayers, and the reference keeps them in fp32. Force F32 even when the
+        // source GGUF carries them narrower or a --tensor-type rule would quantize them.
+        if (model->arch == LLM_ARCH_DEEPSEEK41) {
+            const std::string tname = tensor->name;
+            if (tname.find(".hc_") != std::string::npos || tname.rfind("output_hc_", 0) == 0) {
+                metadata[i].target_type = GGML_TYPE_F32;
+            }
+        }
+
         metadata[i].requires_imatrix = tensor_requires_imatrix(tensor->name, metadata[i].target_type, ftype);
 
         if (params->imatrix) {
