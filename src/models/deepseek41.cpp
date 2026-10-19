@@ -2,6 +2,7 @@
 #include "models.h"
 
 #include "llama-kv-cache-dsv4.h"
+#include "deepseek41-engram-rowstore.h"
 
 #include <algorithm>
 #include <cinttypes>
@@ -179,13 +180,29 @@ void llama_model_deepseek41::load_arch_tensors(llama_model_loader & ml) {
             const int64_t key_len = hparams.engram_key_length;
 
             // The table has hundreds of millions of rows and is far too large to hold in memory,
-            // but each token only touches n_cols of them, so read those rows on demand.
+            // but each token only touches n_cols of them, so read those rows on demand: from the
+            // O_DIRECT row file when one is given, else lazily from the GGUF.
             const std::string embd_name = tn(LLM_TENSOR_ENGRAM_EMBD, "weight", i).str();
             const auto * embd_w = ml.get_weight(embd_name.c_str());
-            if (embd_w == nullptr) {
-                throw std::runtime_error(format("%s is missing", embd_name.c_str()));
+            const char * row_dir = getenv("LLAMA_ENGRAM_ROWFILE_DIR");
+            if (row_dir != nullptr && *row_dir) {
+                if (engram_rowstore.empty()) {
+                    engram_rowstore.resize(engram_n_layer);
+                }
+                const std::string path = format("%s/engram_L%d.v41rows", row_dir, i);
+                engram_rowstore[eg] = std::make_shared<deepseek41_engram_rowstore>(path, (uint32_t) i);
+                if (engram_rowstore[eg]->key_len != key_len) {
+                    throw std::runtime_error(format("%s has rows of %u values, the model wants %" PRId64,
+                                                    path.c_str(), engram_rowstore[eg]->key_len, key_len));
+                }
+                LLAMA_LOG_INFO("%s: engram layer %d reads %s (%" PRIu64 " rows, %s)\n", __func__, i, path.c_str(),
+                               engram_rowstore[eg]->n_rows, engram_rowstore[eg]->direct ? "O_DIRECT" : "buffered");
+            } else if (embd_w == nullptr) {
+                throw std::runtime_error(format("%s is missing and LLAMA_ENGRAM_ROWFILE_DIR is not set", embd_name.c_str()));
             }
-            const int64_t n_rows = embd_w->tensor->ne[1];
+            const int64_t n_rows = (row_dir != nullptr && *row_dir)
+                ? (int64_t) engram_rowstore[eg]->n_rows
+                : embd_w->tensor->ne[1];
 
             // a row index is a bucket offset plus a hash, so the last bucket has to end inside
             uint64_t max_row = 0;
@@ -198,7 +215,11 @@ void llama_model_deepseek41::load_arch_tensors(llama_model_loader & ml) {
                                                 embd_name.c_str(), n_rows, max_row));
             }
 
-            layer.engram_embd = create_tensor(tn(LLM_TENSOR_ENGRAM_EMBD, "weight", i), {key_len, n_rows}, TENSOR_READ_LAZY);
+            if (row_dir == nullptr || !*row_dir) {
+                layer.engram_embd = create_tensor(tn(LLM_TENSOR_ENGRAM_EMBD, "weight", i), {key_len, n_rows}, TENSOR_READ_LAZY);
+            } else if (embd_w != nullptr) {
+                create_tensor(tn(LLM_TENSOR_ENGRAM_EMBD, "weight", i), {key_len, embd_w->tensor->ne[1]}, TENSOR_SKIP);
+            }
             layer.engram_wkv  = create_tensor(tn(LLM_TENSOR_ENGRAM_WKV,  "weight", i), {n_cols * key_len, n_embd * (hc_mult + 1)}, 0);
             layer.engram_q    = create_tensor(tn(LLM_TENSOR_ENGRAM_Q,    "weight", i), {n_embd, hc_mult}, 0);
             layer.engram_k    = create_tensor(tn(LLM_TENSOR_ENGRAM_K,    "weight", i), {n_embd, hc_mult}, 0);
@@ -275,10 +296,12 @@ public:
     bool can_reuse(const llm_graph_params & params) override {
         mctx = static_cast<const llama_kv_cache_dsv4_context *>(params.mctx)->get_raw();
         const int64_t n_cols = (pmodel.hparams.engram_max_ngram_size - 1) * pmodel.hparams.engram_n_head;
-        return rows->ne[0] == n_cols * params.ubatch.n_tokens;
+        return rows ? rows->ne[0] == n_cols * params.ubatch.n_tokens
+                    : emb->ne[1]  == params.ubatch.n_tokens;
     }
 
-    ggml_tensor * rows = nullptr;   // I32 [n_cols * n_tokens]
+    ggml_tensor * rows = nullptr;   // I32 [n_cols * n_tokens], GGUF table
+    ggml_tensor * emb  = nullptr;   // F32 [key_len * n_cols, n_tokens], filled from the row store
 
     const llama_model_deepseek41 & pmodel;
 
@@ -351,6 +374,13 @@ void llm_graph_input_engram::set_input(const llama_ubatch * ubatch) {
         }
     }
 
+    if (emb != nullptr) {
+        const auto & store = *pmodel.engram_rowstore[eg];
+        std::vector<float> host(idx.size() * store.key_len);
+        store.gather(idx.data(), idx.size(), host.data());
+        ggml_backend_tensor_set(emb, host.data(), 0, host.size()*sizeof(float));
+        return;
+    }
     ggml_backend_tensor_set(rows, idx.data(), 0, idx.size()*ggml_element_size(rows));
 }
 
@@ -365,6 +395,17 @@ ggml_tensor * llama_model_deepseek41::graph::build_inp_engram(
     const auto * mctx_cur = static_cast<const llama_kv_cache_dsv4_context *>(mctx);
 
     auto inp = std::make_unique<llm_graph_input_engram>(pmodel, mctx_cur->get_raw(), pmodel.engram_index(il));
+
+    const int eg = pmodel.engram_index(il);
+    if (!pmodel.engram_rowstore.empty() && pmodel.engram_rowstore[eg]) {
+        // rows arrive already dequantized (fp8 * e8m0, rounded to bf16 as the reference does)
+        inp->emb = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, key_len * n_cols, n_tokens);
+        ggml_set_input(inp->emb);
+        ggml_tensor * emb = inp->emb;
+        res->add_input(std::move(inp));
+        cb(emb, "engram_embd", il);
+        return emb;
+    }
 
     inp->rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_cols * n_tokens);
     ggml_set_input(inp->rows);

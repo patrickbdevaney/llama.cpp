@@ -1394,6 +1394,10 @@ struct llama_model_deepseek41 : public llama_model_deepseek4 {
     // position of layer il in the engram constants, or -1 if that layer has no engram
     int engram_index(int il) const;
 
+    // [engram_n_layer] O_DIRECT row stores, set when LLAMA_ENGRAM_ROWFILE_DIR is given; the
+    // engram_embd tensors are then never loaded (deepseek41-engram-rowstore.h)
+    std::vector<std::shared_ptr<struct deepseek41_engram_rowstore>> engram_rowstore;
+
     struct graph : public llama_model_deepseek4::graph {
         graph(const llama_model & model, const llm_graph_params & params);
 
