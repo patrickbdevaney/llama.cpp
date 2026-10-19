@@ -1433,6 +1433,10 @@ struct llama_model_deepseek41 : public llama_model_deepseek4 {
                 ggml_tensor * cur,
                 ggml_tensor * inp_pos,
                 int il) const;
+
+        // the top-k each index source published, read by the layers after it (as
+        // shared_attn.topk_idxs in the reference); without it a reader attends to every row
+        mutable std::array<ggml_tensor *, LLAMA_MAX_LAYERS> published_top_k{};
     };
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;

@@ -745,10 +745,17 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention_v41(
                     ctx0, persist_score, inp_comp.state_persist_dst_idxs, il));
     }
 
-    // an index source picks the positions; the layers in between reuse what it picked
+    // an index source picks the positions; the layers in between reuse what it picked. The
+    // picks index the compressed rows of the shared stream, so they only carry over between
+    // layers at the same ratio, where the row count is the same.
     ggml_tensor * top_k = nullptr;
     if (hparams.dsv41_is_index_source(il)) {
         top_k = build_indexer_top_k(model, inp_dsv4, inp_comp, qr, cur, inp_pos, il);
+        published_top_k[il] = top_k;
+    } else if (const int32_t src = hparams.dsv41_topk_source[il];
+               src >= 0 && hparams.dsv4_compress_ratios[src] == (uint32_t) ratio && published_top_k[src]) {
+        top_k = published_top_k[src];
+        cb(top_k, "idx_top_k_reused", il);
     }
 
     ggml_tensor * k_rot = inp_attn->self_k_rot;
