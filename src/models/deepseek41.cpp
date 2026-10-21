@@ -78,6 +78,28 @@ void llama_model_deepseek41::load_arch_hparams(llama_model_loader & ml) {
         }
     }
 
+    // optional REAP heal gain on the routed-expert sum, one f32 per decoder layer
+    hparams.reap_routed_gain.fill(1.0f);
+    hparams.reap_has_routed_gain = false;
+    {
+        std::vector<float> gain;
+        if (ml.get_arr(LLM_KV_REAP_ROUTED_GAIN, gain, false)) {
+            if (gain.size() != hparams.n_layer()) {
+                throw std::runtime_error(format("reap.routed_gain has %zu entries, expected one per layer (%u)",
+                                                gain.size(), hparams.n_layer()));
+            }
+            for (size_t il = 0; il < gain.size(); ++il) {
+                if (!std::isfinite(gain[il]) || gain[il] <= 0.0f) {
+                    throw std::runtime_error(format("reap.routed_gain[%zu] = %f is not a positive finite gain", il, gain[il]));
+                }
+                hparams.reap_routed_gain[il] = gain[il];
+                hparams.reap_has_routed_gain |= gain[il] != 1.0f;
+            }
+            LLAMA_LOG_INFO("%s: REAP routed-expert heal gain present (layer 0: %.6f, layer %zu: %.6f)\n", __func__,
+                           gain.front(), gain.size() - 1, gain.back());
+        }
+    }
+
     ml.get_arr(LLM_KV_ENGRAM_MULTIPLIERS, engram_multipliers);
     ml.get_arr(LLM_KV_ENGRAM_PRIMES,      engram_primes);
     ml.get_arr(LLM_KV_ENGRAM_OFFSETS,     engram_offsets);
@@ -951,6 +973,14 @@ llama_model_deepseek41::graph::graph(const llama_model & model, const llm_graph_
                 (llama_expert_gating_func_type) hparams.expert_gating_func,
                 il);
         cb(moe_out, "ffn_moe_out", il);
+
+        // REAP heal gain: scales the routed weighted sum only, never the shared expert. The
+        // reference sums y = sum_k w_k * expert_k(x) + shared(x), and every routed expert ends in
+        // its w2, so this equals the gain folded into the routed down-projections (NVFP4/Thor).
+        if (hparams.reap_has_routed_gain && hparams.reap_routed_gain[il] != 1.0f) {
+            moe_out = ggml_scale(ctx0, moe_out, hparams.reap_routed_gain[il]);
+            cb(moe_out, "ffn_moe_out_healed", il);
+        }
 
         ggml_tensor * ffn_shexp = build_ffn(cur,
                 layer.ffn_up_shexp, nullptr, nullptr,

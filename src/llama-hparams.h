@@ -315,6 +315,12 @@ struct llama_hparams {
     uint32_t engram_max_ngram_size  = 0;
     std::array<uint32_t, LLAMA_MAX_LAYERS> engram_layer_ids;
 
+    // REAP heal gain for DeepSeek-V4.1: per decoder layer, scales the routed-expert weighted sum
+    // before the shared expert is added (the same as folding it into every routed down-proj).
+    // Read from the optional %s.reap.routed_gain; all 1.0 and unused when the key is absent.
+    bool reap_has_routed_gain = false;
+    std::array<float, LLAMA_MAX_LAYERS> reap_routed_gain;
+
     // DeepSeek-V4.1 compresses KV on a few source layers and shares each stream with the layers
     // that follow, so for every layer these hold the layer that published what it reads, or -1
     // when it reads nothing. A layer whose entry is itself is a source. The KV cache needs these

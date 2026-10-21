@@ -302,6 +302,7 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
     { LLM_KV_ENGRAM_OFFSETS,                         "%s.engram.offsets"                         },
     { LLM_KV_ENGRAM_TOKEN_MAP,                       "%s.engram.token_map"                       },
     { LLM_KV_ENGRAM_PAD_ID,                          "%s.engram.pad_id"                          },
+    { LLM_KV_REAP_ROUTED_GAIN,                       "%s.reap.routed_gain"                       },
     { LLM_KV_ATTENTION_OUTPUT_GROUP_COUNT,           "%s.attention.output_group_count"           },
     { LLM_KV_ATTENTION_OUTPUT_LORA_RANK,             "%s.attention.output_lora_rank"             },
     { LLM_KV_ATTENTION_COMPRESS_ROPE_FREQ_BASE,      "%s.attention.compress_rope_freq_base"      },
