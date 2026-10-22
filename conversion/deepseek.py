@@ -1485,3 +1485,53 @@ class DeepseekV41Model(DeepseekV4Model):
             if tensor_name in v41_only:
                 return v41_only[tensor_name]
         return super()._map_dsv4_tensor_name(name, bid)
+
+
+class DeepseekV41DSparkModel(DeepseekV4DSparkModel, DeepseekV41Model):
+    """The V4.1 DSpark drafter (mtp.0..2) as a standalone `dflash` sidecar GGUF.
+
+    The V4.1 parts (nested text_config, [32, 32] FP8 blocks, vision filter) come from DeepseekV41Model and
+    the drafter export from DeepseekV4DSparkModel. Where V4.1 differs from the V4 drafter:
+      * the drafter has its own routed experts (dspark_n_routed_experts, dspark_num_experts_per_tok), not
+        the target's;
+      * the Markov head is stored as markov_head.embed / markov_head.head;
+      * it reads the attention INPUT of its target layers (inference/model.py), which is llama.cpp's
+        layer input at the same index, so target_layers are written as configured. V4 drafters read
+        layer outputs and are written as layer + 1;
+      * the target's Engram tables and hash constants belong to the target GGUF, not the drafter.
+    """
+
+    model_arch = gguf.MODEL_ARCH.DFLASH
+
+    _DSPARK_ROOT_MAP = {
+        **DeepseekV4DSparkModel._DSPARK_ROOT_MAP,
+        "markov_head.embed.weight": (gguf.MODEL_TENSOR.DSPARK_MARKOV_W1, ".weight"),
+        "markov_head.head.weight": (gguf.MODEL_TENSOR.DSPARK_MARKOV_W2, ".weight"),
+    }
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.hparams["n_routed_experts"] = self.hparams["dspark_n_routed_experts"]
+        self.hparams["num_experts_per_tok"] = self.hparams["dspark_num_experts_per_tok"]
+        self.hparams["engram_layer_ids"] = None
+
+    @staticmethod
+    def _rekey_mtp_tensor_name(name: str) -> str:
+        match = re.match(r"mtp\.(\d+)\.(markov_head\.(?:embed|head)\.weight)$", name)
+        if match is not None:
+            return match.group(2)
+        return DeepseekV4DSparkModel._rekey_mtp_tensor_name(name)
+
+    def tensor_force_quant(self, name: str, new_name: str, bid: int | None, n_dims: int) -> gguf.GGMLQuantizationType | bool:
+        # the drafter's routers and confidence head are tiny: F32 (exact from BF16), as the reference drafter GGUF stores them
+        if new_name.endswith((".ffn_gate_inp.weight", "conf_proj.weight")):
+            return gguf.GGMLQuantizationType.F32
+        return super().tensor_force_quant(name, new_name, bid, n_dims)
+
+    def set_gguf_parameters(self):
+        # DeepseekV4DSparkModel's version writes V4's layer + 1 targets; skip it, keep the rest of the chain
+        DeepseekV41Model.set_gguf_parameters(self)
+        self.gguf_writer.add_block_size(self.hparams["dspark_block_size"])
+        self.gguf_writer.add_target_layers(list(self.hparams["dspark_target_layer_ids"]))
+        self.gguf_writer.add_sample_from_anchor(True)
+        self.gguf_writer.add_has_confidence_head(True)
