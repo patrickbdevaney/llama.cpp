@@ -304,6 +304,20 @@ llama_context::llama_context(
         }
     }
 
+    // DeepSeek-V4.1: this tree has no two-level candidate mask (deepseek41.cpp). Past candidate_topk_blocks x
+    // candidate_block_size = 2048 x 8 compressed rows of the ratio-1 source the reference restricts layers 21-39 to
+    // the picked blocks and this graph does not, so output silently diverges. Clamp until the mask is implemented;
+    // LLAMA_DSV41_UNSAFE_LONG_CTX=1 lifts the clamp (only for testing a port of the mask).
+    if (model.arch == LLM_ARCH_DEEPSEEK41 && !getenv("LLAMA_DSV41_UNSAFE_LONG_CTX")) {
+        const uint32_t cap = 2048u * 8u;
+        if (cparams.n_ctx_seq > cap) {
+            LLAMA_LOG_WARN("%s: DeepSeek-V4.1: n_ctx_seq %u clamped to %u: the candidate-block mask is not implemented "
+                           "in this build, and longer contexts diverge from the model\n", __func__, cparams.n_ctx_seq, cap);
+            cparams.n_ctx_seq = cap;
+            cparams.n_ctx     = cparams.kv_unified ? cap : cap * cparams.n_seq_max;
+        }
+    }
+
     LLAMA_LOG_INFO("%s: n_seq_max             = %u\n",   __func__, cparams.n_seq_max);
     LLAMA_LOG_INFO("%s: n_ctx                 = %u\n",   __func__, cparams.n_ctx);
     LLAMA_LOG_INFO("%s: n_ctx_seq             = %u\n",   __func__, cparams.n_ctx_seq);
