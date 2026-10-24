@@ -333,6 +333,16 @@ struct llama_hparams {
     bool dsv41_owns_index_k   (uint32_t il) const { return dsv41_index_key_source[il] == (int32_t) il; }
     bool dsv41_is_index_source(uint32_t il) const { return dsv41_topk_source[il]      == (int32_t) il; }
 
+    // DeepSeek-V4.1 two-level candidate mask (model.py select_candidate_blocks), read from the
+    // optional %s.candidate.* keys: index sources after dsv41_candidate_source score only inside
+    // its top dsv41_candidate_topk_blocks blocks of dsv41_candidate_block_size compressed rows.
+    // -1 means the file carries no mask, and llama_context then caps the context (see there).
+    int32_t  dsv41_candidate_source      = -1;
+    uint32_t dsv41_candidate_topk_blocks = 0;
+    uint32_t dsv41_candidate_block_size  = 0;
+
+    bool dsv41_has_candidates() const { return dsv41_candidate_source >= 0; }
+
     uint32_t ple_ngram_size      = 0;
     uint32_t ple_heads_per_ngram = 0;
     uint32_t ple_conv_kernel     = 0;

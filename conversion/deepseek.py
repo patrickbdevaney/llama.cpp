@@ -1280,6 +1280,20 @@ class DeepseekV41Model(DeepseekV4Model):
     def set_gguf_parameters(self):
         super().set_gguf_parameters()
         hparams = self.hparams
+
+        # Two-level candidate mask (model.py select_candidate_blocks). Without these keys the
+        # runtime has no mask and caps the context at topk_blocks * block_size compressed rows.
+        cand_src = hparams.get("candidate_source_layer_id", -1)
+        if cand_src is not None and cand_src >= 0:
+            arch = self.gguf_writer.arch
+            topk_blocks = int(hparams["candidate_topk_blocks"])
+            block_size = int(hparams["candidate_block_size"])
+            if topk_blocks <= 0 or block_size <= 0 or 256 % block_size != 0:
+                raise ValueError(f"candidate mask: {topk_blocks} blocks of {block_size} rows is not supported")
+            self.gguf_writer.add_uint32(gguf.Keys.Candidate.SOURCE_LAYER.format(arch=arch), int(cand_src))
+            self.gguf_writer.add_uint32(gguf.Keys.Candidate.TOPK_BLOCKS.format(arch=arch), topk_blocks)
+            self.gguf_writer.add_uint32(gguf.Keys.Candidate.BLOCK_SIZE.format(arch=arch), block_size)
+
         if (engram_ids := hparams.get("engram_layer_ids")) is not None:
             # These MUST carry the arch prefix, not a literal "deepseek4.". llama.cpp resolves
             # every LLM_KV_* as "{arch}.{key}", so a hardcoded prefix means the runtime looks up

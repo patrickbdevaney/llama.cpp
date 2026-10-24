@@ -3,6 +3,7 @@
 
 #include "llama-kv-cache-dsv4.h"
 #include "deepseek41-engram-rowstore.h"
+#include "deepseek41-candidates.h"
 
 #include <algorithm>
 #include <cinttypes>
@@ -30,9 +31,10 @@
 // it derives index keys from that shared latent rather than from a second compressor. See
 // build_attention_v41().
 //
-// Not implemented: the two level candidate mask. Measured against the reference, it selects every
-// block until the compressed length passes candidate_topk_blocks * candidate_block_size, so it
-// changes nothing below that and the context is capped there instead.
+// The two-level candidate mask (deepseek41-candidates.h) is built when the file carries the
+// %s.candidate.* keys. It keeps every block until the compressed length passes
+// candidate_topk_blocks * candidate_block_size, so below that the graph is the one without it.
+// Without the keys llama_context caps the context there instead.
 
 // mean over the hyper-connection copies; deepseek4.cpp keeps its own copy of this
 static ggml_tensor * dsv41_hc_mean(ggml_context * ctx, ggml_tensor * x) {
@@ -97,6 +99,30 @@ void llama_model_deepseek41::load_arch_hparams(llama_model_loader & ml) {
             }
             LLAMA_LOG_INFO("%s: REAP routed-expert heal gain present (layer 0: %.6f, layer %zu: %.6f)\n", __func__,
                            gain.front(), gain.size() - 1, gain.back());
+        }
+    }
+
+    // optional two-level candidate mask; checked against the layer roles in load_arch_tensors
+    {
+        uint32_t src = 0;
+        hparams.dsv41_candidate_source      = -1;
+        hparams.dsv41_candidate_topk_blocks = 0;
+        hparams.dsv41_candidate_block_size  = 0;
+        if (ml.get_key(LLM_KV_CANDIDATE_SOURCE_LAYER, src, false)) {
+            ml.get_key(LLM_KV_CANDIDATE_TOPK_BLOCKS, hparams.dsv41_candidate_topk_blocks);
+            ml.get_key(LLM_KV_CANDIDATE_BLOCK_SIZE,  hparams.dsv41_candidate_block_size);
+            if (src >= hparams.n_layer()) {
+                throw std::runtime_error(format("candidate source layer %u is out of range", src));
+            }
+            // the compressed plans and caches are padded to multiples of 256 rows, and a block
+            // must not straddle that end
+            const uint32_t bs = hparams.dsv41_candidate_block_size;
+            if (hparams.dsv41_candidate_topk_blocks == 0 || bs == 0 || 256 % bs != 0) {
+                throw std::runtime_error(format("candidate mask: %u blocks of %u rows is not supported "
+                                                "(need at least one block, and a block size dividing 256)",
+                                                hparams.dsv41_candidate_topk_blocks, bs));
+            }
+            hparams.dsv41_candidate_source = (int32_t) src;
         }
     }
 
@@ -287,6 +313,25 @@ void llama_model_deepseek41::load_arch_tensors(llama_model_loader & ml) {
         hparams.dsv41_kv_source[i]        = last_kv_source;
         hparams.dsv41_index_key_source[i] = last_key_owner;
         hparams.dsv41_topk_source[i]      = last_index_source;
+    }
+
+    // The candidate mask is a per-row mask over the source's compressed rows, so the source must
+    // run an indexer and every later index source must read rows laid out the same way (the
+    // reference would fail to broadcast otherwise).
+    if (hparams.dsv41_has_candidates()) {
+        const int32_t cs = hparams.dsv41_candidate_source;
+        if (!hparams.dsv41_is_index_source(cs) || hparams.dsv4_compress_ratios[cs] == 0) {
+            throw std::runtime_error(format("candidate source layer %d is not an index source", cs));
+        }
+        for (int i = cs + 1; i < n_layer; ++i) {
+            if (hparams.dsv41_is_index_source(i) &&
+                hparams.dsv4_compress_ratios[i] != hparams.dsv4_compress_ratios[cs]) {
+                throw std::runtime_error(format("index source %d compresses at ratio %u, candidate source %d at %u",
+                                                i, hparams.dsv4_compress_ratios[i], cs, hparams.dsv4_compress_ratios[cs]));
+            }
+        }
+        LLAMA_LOG_INFO("%s: candidate mask: layers after %d keep the top %u blocks of %u compressed rows\n", __func__,
+                       cs, hparams.dsv41_candidate_topk_blocks, hparams.dsv41_candidate_block_size);
     }
 
     // a compressor with no gate only makes sense where there is nothing to pool
@@ -643,6 +688,24 @@ ggml_tensor * llama_model_deepseek41::graph::build_indexer_top_k(
 
     score = ggml_add(ctx0, score, mask);
     cb(score, "idx_score", il);
+
+    // Two-level top-k (model.py Indexer.forward): the candidate source picks blocks from its own
+    // score but does not restrict itself; every later index source scores only inside them.
+    // published_candidates stays null while every block is kept, which is then a no-op.
+    if (hparams.dsv41_has_candidates()) {
+        const int32_t cs = hparams.dsv41_candidate_source;
+        if (il == cs) {
+            published_candidates = dsv41_build_candidate_blocks(ctx0, score, mask,
+                    hparams.dsv41_candidate_topk_blocks, hparams.dsv41_candidate_block_size);
+            if (published_candidates) {
+                cb(published_candidates, "idx_cand_blocks", il);
+            }
+        } else if (il > cs && published_candidates) {
+            score = dsv41_apply_candidate_blocks(ctx0, score, published_candidates,
+                    hparams.dsv41_candidate_block_size);
+            cb(score, "idx_score_cand", il);
+        }
+    }
 
     const uint32_t n_top_k = score->ne[0] < hparams.indexer_top_k ? score->ne[0] : hparams.indexer_top_k;
 

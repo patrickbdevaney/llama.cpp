@@ -247,6 +247,11 @@ class Keys:
         TOKEN_MAP      = "{arch}.engram.token_map"
         PAD_ID         = "{arch}.engram.pad_id"
 
+    class Candidate:
+        SOURCE_LAYER = "{arch}.candidate.source_layer"
+        TOPK_BLOCKS  = "{arch}.candidate.topk_blocks"
+        BLOCK_SIZE   = "{arch}.candidate.block_size"
+
     class PerLayerEmbedding:
         LAYERS             = "{arch}.ple.layers"
         NGRAM_SIZE         = "{arch}.ple.ngram_size"

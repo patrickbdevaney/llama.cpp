@@ -1441,6 +1441,10 @@ struct llama_model_deepseek41 : public llama_model_deepseek4 {
         // the top-k each index source published, read by the layers after it (as
         // shared_attn.topk_idxs in the reference); without it a reader attends to every row
         mutable std::array<ggml_tensor *, LLAMA_MAX_LAYERS> published_top_k{};
+
+        // the candidate source's kept blocks, F32 [n_blocks, n_q, 1, n_stream] of 0 / -inf (as
+        // shared_attn.candidates in the reference); null when absent or when every block is kept
+        mutable ggml_tensor * published_candidates = nullptr;
     };
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
