@@ -395,8 +395,8 @@ void llm_graph_input_engram::set_input(const llama_ubatch * ubatch) {
     const uint64_t * prime = pmodel.engram_primes.data()  + (size_t) eg*n_cols;
     const uint64_t * offset = pmodel.engram_offsets.data() + (size_t) eg*n_cols;
 
-    // an image arrives as an embd batch, so ubatch->token is null; the reference gives those
-    // positions no engram contribution at all, which the padding token stands in for here
+    // embd (image) ubatches never get here, the graph skips the engram for them; pad covers
+    // out-of-range ids and blocked look-back
     const int32_t pad = (int32_t) pmodel.engram_pad_id;
     auto map_of = [&](llama_token t) -> uint64_t {
         if (t < 0 || (size_t) t >= pmodel.engram_token_map.size()) {
@@ -968,8 +968,11 @@ llama_model_deepseek41::graph::graph(const llama_model & model, const llm_graph_
             ggml_build_forward_expand(gf, res->t_layer_inp[il]);
         }
 
-        // the engram sits before the block and writes straight into the stream
-        if (pmodel.engram_index(il) >= 0) {
+        // the engram sits before the block and writes straight into the stream. An image arrives
+        // as an embd ubatch, and the reference zeroes the gate on image positions, so the block
+        // is skipped outright. Text after the image stops its look-back there on its own: those
+        // cells carry LLAMA_TOKEN_NULL, the reference's DEAD.
+        if (pmodel.engram_index(il) >= 0 && ubatch.embd == nullptr) {
             inpL = build_engram(model, inpL, build_inp_engram(model, il), il);
             cb(inpL, "engram_out", il);
         }

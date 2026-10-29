@@ -1552,3 +1552,45 @@ class DeepseekV41DSparkModel(DeepseekV4DSparkModel, DeepseekV41Model):
         # not read by this loader; written so the sidecar carries every key of the upstream (PR #30817) drafter
         self.gguf_writer.add_feed_forward_length(self.hparams["moe_intermediate_size"])
         self.gguf_writer.add_bool(f"{self.gguf_writer.arch}.hyper_connection.single_pass", True)
+
+
+@ModelBase.register("DeepseekV41ForCausalLM")
+@ModelBase.example("deepseek-ai/DeepSeek-V4.1-Flash-1017")
+class DeepseekV41VisionModel(DeepseekV4FlashVisionModel):
+    """DeepSeek-V4.1 vision tower (projector deepseek41v): the V4-Flash-Vision ViT + 3x3 aligner, with the V4.1 token
+    block ([START] ([IMAGE]*w [NEWLINE])*h [END], no pads) and resize plan. ref: inference/vision.py,
+    inference/image_processor.py of deepseek-ai/DeepSeek-V4.1-Flash-1017. The checkpoint config is HF-style
+    (vision_config); image_start / image_end / image_newline are written like V4's sentinels, there is no image_pad."""
+
+    def get_vision_config(self) -> dict[str, Any] | None:
+        vc = self.global_config.get("vision_config")
+        if not vc or vc.get("num_hidden_layers", 0) == 0:
+            raise ValueError("DeepseekV41VisionModel requires vision_config.num_hidden_layers > 0")
+        return {
+            "num_hidden_layers":   vc["num_hidden_layers"],
+            "hidden_size":         vc["hidden_size"],
+            "num_attention_heads": vc["num_attention_heads"],
+            "intermediate_size":   vc["intermediate_size"],
+            "patch_size":          vc["patch_size"],
+            # dynamic resolution; only used for compat / warmup
+            "image_size":          vc["patch_size"] * vc["downsample_ratio"] * 16,
+            "rope_theta":          vc.get("rope_theta", 10000.0),
+            "downsample_ratio":    vc["downsample_ratio"],
+            "min_pixels":          vc["min_pixels"],
+            "max_image_tokens":    vc["max_image_tokens"],
+            "max_wh_ratio":        vc.get("max_wh_ratio"),
+        }
+
+    def set_gguf_parameters(self):
+        assert self.hparams_vision is not None
+        super(DeepseekV4FlashVisionModel, self).set_gguf_parameters()
+        self.gguf_writer.add_clip_projector_type(gguf.VisionProjectorType.DEEPSEEK41V)
+        # pytorch default eps (vision.py), not the LLM rms_norm_eps (1e-20)
+        self.gguf_writer.add_vision_attention_layernorm_eps(1e-6)
+        self.gguf_writer.add_vision_use_silu(True)
+        self.gguf_writer.add_vision_projector_scale_factor(self.hparams_vision["downsample_ratio"])
+        self.gguf_writer.add_vision_min_pixels(self.hparams_vision["min_pixels"])
+        # hardcoded in clip.cpp (PROJECTOR_TYPE_DEEPSEEK41V); add GGUF keys if a later model differs
+        assert self.hparams_vision["max_image_tokens"] == 1024, self.hparams_vision["max_image_tokens"]
+        assert self.hparams_vision["max_wh_ratio"] is None, self.hparams_vision["max_wh_ratio"]
+        assert self.hparams_vision["rope_theta"] == 10000, self.hparams_vision["rope_theta"]
