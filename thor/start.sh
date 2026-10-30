@@ -12,6 +12,7 @@
 #   VISION      1 = load the mmproj if present                                default 1 (0 with DSPARK=1)
 #   DSPARK      1 = speculative decoding with the DSpark sidecar               default 0
 #   DRAFT_N     tokens drafted per step with DSPARK=1                          default 3
+#   P_MIN       DSpark confidence cutoff per drafted token (0 = always draft DRAFT_N)  default 0.5
 #   HOST PORT   listen address                                                 default 127.0.0.1 8080
 #   EXTRA       further llama-server arguments, appended verbatim
 set -euo pipefail
@@ -23,6 +24,7 @@ CTX=${CTX:-16384}
 DSPARK=${DSPARK:-0}
 VISION=${VISION:-$([ "$DSPARK" = 1 ] && echo 0 || echo 1)}    # DSpark was measured text-only
 DRAFT_N=${DRAFT_N:-3}
+P_MIN=${P_MIN:-0.5}     # stop a draft when the DSpark confidence head drops below this
 HOST=${HOST:-127.0.0.1}
 PORT=${PORT:-8080}
 
@@ -70,7 +72,7 @@ fi
 if [ "$DSPARK" = 1 ]; then
     draft=$MODEL_DIR/dspark-DeepSeek-V4.1-Flash-1017-Q8_0.gguf
     [ -f "$draft" ] || die "DSPARK=1 but no $draft"
-    args+=(-md "$draft" -ngld 999 --spec-type draft-dspark --spec-draft-n-max "$DRAFT_N")
+    args+=(-md "$draft" -ngld 999 --spec-type draft-dspark --spec-draft-n-max "$DRAFT_N" --spec-draft-p-min "$P_MIN")
 fi
 
 export LLAMA_ENGRAM_ROWFILE_DIR=$ENGRAM_DIR

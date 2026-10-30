@@ -17,8 +17,8 @@ These numbers come from `thor/start.sh` at its defaults on a Jetson AGX Thor (CU
 
 | | `thor/start.sh` | `DSPARK=1 thor/start.sh` |
 |---|---:|---:|
-| decode, 256-token chat answers | 12.3–12.5 tok/s | **16.6–19.9 tok/s** (1.33–1.61×) |
-| DSpark acceptance (3 drafted per step) | | 55–72% |
+| decode, 256-token chat answers | 12.3–12.5 tok/s | **17.3–20.7 tok/s** (1.38–1.68×) |
+| DSpark acceptance (up to 3 drafted per step, `P_MIN` 0.5) | | 73–81% |
 | prefill, 1.8K-token prompt | 159 tok/s | |
 | prefill, 5.9K-token prompt | 147 tok/s | |
 | image + question (215 prompt tokens) | 84 tok/s prompt, 12.4 tok/s answer | |
@@ -38,6 +38,7 @@ These numbers come from `thor/start.sh` at its defaults on a Jetson AGX Thor (CU
 | `VISION` | `1` (`0` with `DSPARK=1`) | load the mmproj if it is present |
 | `DSPARK` | `0` | `1` adds `-md dspark-… --spec-type draft-dspark`; measured text-only, so `VISION` defaults to 0 in this mode |
 | `DRAFT_N` | `3` | tokens drafted per step |
+| `P_MIN` | `0.5` | stop drafting when DSpark's confidence head is below this. This makes drafting adaptive per step: short drafts on uncertain chat, full drafts on predictable code and math. A sweep of 0, 0.3, 0.5 and 0.7, plus 5 drafts, put 0.5 best by about 4% on code and explanation, from single runs |
 | `HOST`, `PORT` | `127.0.0.1`, `8080` | |
 | `EXTRA` | | further `llama-server` flags |
 
