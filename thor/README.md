@@ -26,7 +26,7 @@ These numbers come from `thor/start.sh` at its defaults on a Jetson AGX Thor (CU
 
 - **Image input works.** For the [`test-1.jpeg`](../tools/mtmd/test-1.jpeg) newspaper page, the model reads the masthead, the date ("MONDAY, JULY 21, 1969"), the headline ("MEN WALK ON MOON"), the sub-headline and both column headlines correctly. A low-resolution 531×229 crop of the same page made it loop while second-guessing the masthead, so give it legible images.
 - **DSpark output is not byte-identical to plain decoding.** Every token is still the target model's greedy choice. But the batched verify pass sums in a different order from single-token decode, so a near-tie can flip ("…with the previous one" vs "…with the last one…"). This is llama.cpp's usual speculative behaviour, not a drafter error.
-- **The pure-CUDA server is about 2× faster.** [`patrickbdevaney/deepseek-v4.1-flash-cuda-server`](https://github.com/patrickbdevaney/deepseek-v4.1-flash-cuda-server) runs the separate `thor-v1` build at 25.0 tok/s decode and 739 tok/s prefill on the same box. It is text only.
+- **The pure-CUDA server is about 2× faster.** [`patrickbdevaney/deepseek-v4.1-flash-cuda-server`](https://github.com/patrickbdevaney/deepseek-v4.1-flash-cuda-server) runs the separate `thor-v1` build at 25–40 tok/s decode (DSpark speculation on) and 739 tok/s prefill on the same box. It is text only.
 
 ## `thor/start.sh` settings
 
