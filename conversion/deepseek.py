@@ -1535,3 +1535,6 @@ class DeepseekV41DSparkModel(DeepseekV4DSparkModel, DeepseekV41Model):
         self.gguf_writer.add_target_layers(list(self.hparams["dspark_target_layer_ids"]))
         self.gguf_writer.add_sample_from_anchor(True)
         self.gguf_writer.add_has_confidence_head(True)
+        # not read by this loader; written so the sidecar carries every key of the upstream (PR #30817) drafter
+        self.gguf_writer.add_feed_forward_length(self.hparams["moe_intermediate_size"])
+        self.gguf_writer.add_bool(f"{self.gguf_writer.arch}.hyper_connection.single_pass", True)
