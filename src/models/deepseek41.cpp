@@ -36,6 +36,20 @@
 // candidate_topk_blocks * candidate_block_size, so below that the graph is the one without it.
 // Without the keys llama_context caps the context there instead.
 
+// ggml_cont(ggml_permute(t, 2, 1, 0, 3)) for a contiguous [a, b, c, 1], as two dim-0/1 transposes.
+// The CUDA copy only tiles a 0<->1 swap; the direct 0<->2 permute of the indexer score fell to the
+// scalar copy at ~128 MB/s (seconds per layer at 32K rows, 79% of GPU time in the m7 profile).
+// Pure copies, so the result is bit-identical.
+static ggml_tensor * dsv41_swap02(ggml_context * ctx, ggml_tensor * t) {
+    if (t->ne[3] != 1 || !ggml_is_contiguous(t)) {
+        return ggml_cont(ctx, ggml_permute(ctx, t, 2, 1, 0, 3));
+    }
+    const int64_t a = t->ne[0], b = t->ne[1], c = t->ne[2];
+    ggml_tensor * x = ggml_cont(ctx, ggml_transpose(ctx, ggml_reshape_2d(ctx, t, a, b*c)));   // [b, c, a]
+    x = ggml_reshape_3d(ctx, x, b, c, a);
+    return ggml_cont(ctx, ggml_permute(ctx, x, 1, 0, 2, 3));                                // [c, b, a]
+}
+
 // mean over the hyper-connection copies; deepseek4.cpp keeps its own copy of this
 static ggml_tensor * dsv41_hc_mean(ggml_context * ctx, ggml_tensor * x) {
     const int64_t hc = x->ne[1];
@@ -672,12 +686,12 @@ ggml_tensor * llama_model_deepseek41::graph::build_indexer_top_k(
     idx_k = ggml_permute(ctx0, idx_k, 0, 2, 1, 3);
 
     ggml_tensor * score = ggml_mul_mat(ctx0, idx_k, idx_q);
-    score = ggml_cont(ctx0, ggml_permute(ctx0, score, 2, 1, 0, 3));
+    score = dsv41_swap02(ctx0, score);
 
     score = ggml_relu(ctx0, score);
     score = ggml_mul(ctx0, score, idx_w);
     score = ggml_sum_rows(ctx0, score);
-    score = ggml_cont(ctx0, ggml_permute(ctx0, score, 2, 1, 0, 3));
+    score = dsv41_swap02(ctx0, score);
 
     // the attention mask is F16 when flash attention is on, and this score is F32. the mask only
     // ever holds 0 or -inf, so widening it is exact.
