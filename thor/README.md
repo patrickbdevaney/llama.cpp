@@ -57,7 +57,8 @@ V4.1's two Engram tables (about 101 GB each) are not in the GGUF. They are read 
 | REAP heal gain on the routed-expert sum | `deepseek41.reap.routed_gain` |
 | export the V4.1 DSpark drafter (`--dspark`) + target-layer fix | `convert_hf_to_gguf.py --dspark`; V4.1 taps layer inputs |
 | clamp `n_ctx_seq` to 16384 | until the candidate-block mask is validated |
-| two-level candidate-block mask | lifts the clamp when the GGUF carries `deepseek41.candidate.*` (experimental, below) |
+| two-level candidate-block mask | lifts the clamp when `deepseek41.candidate.*` is set (validated at 32K, below) |
+| indexer score transposes as two tiled copies | 32K prompts: from more than 2 h to 14.6 min, bit-identical |
 | vision projector `deepseek41v` | from PR #30817; Engram off on image ubatches, `bias_vl` on image rows |
 | mmproj export for `DeepseekV41ForCausalLM` | `convert_hf_to_gguf.py --mmproj` |
 
