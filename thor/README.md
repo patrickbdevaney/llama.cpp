@@ -63,7 +63,18 @@ V4.1's two Engram tables (about 101 GB each) are not in the GGUF. They are read 
 
 ## Context length
 
-The published GGUF runs at up to 16,384 tokens. Above that, V4.1 attends through a two-level candidate-block selection: 2048 blocks of 8 rows chosen at layer 20. That selection is implemented here and passes its CPU tests (15/15). It is enabled by `--override-kv deepseek41.candidate.source_layer=int:20,deepseek41.candidate.topk_blocks=int:2048,deepseek41.candidate.block_size=int:8`. Its GPU validation at 32K is not finished: the first run was far slower than expected and was stopped. Treat contexts above 16K as experimental.
+Up to 16,384 tokens the model runs as published. Above that, V4.1 attends through a two-level candidate-block selection: 2048 blocks of 8 rows, chosen at layer 20. That selection is on this branch. The published GGUF predates the metadata keys that switch it on, so `CTX=32768 thor/start.sh` passes them with `--override-kv`. Without them, the context is clamped to 16,384.
+
+**Validated at 32K (2026-10-30).** On a 32,767-token held-out row, teacher-forced against the CUDA engine as teacher:
+
+| positions | mask on | mask off | on − off, 95% block-bootstrap CI |
+|---|---|---|---|
+| 12,287–16,382 | KL 0.0563 | KL 0.0563 | identical at every position |
+| 16,384–32,766 | KL 0.1050, top-1 0.985 | KL 0.1044, top-1 0.984 | KL +0.00055 [−0.00001, +0.00122]; NLL +0.00024 [−0.00024, +0.00081] |
+
+At 32K the mask is within noise of running without it. That is expected: it keeps 2048 of 4096 blocks, and the indexer's top-512 rows almost always fall inside them. It matches the reference model's semantics and should matter more at 64K and beyond, which has not been measured here.
+
+Long prompts are slow on this branch. One 32K-token prompt takes about 14.6 minutes to process, against about 1 minute for 8K, because the indexer and sparse attention run as dense ggml ops. Before the transpose fix in `deepseek41 : indexer score transposes…`, a single 32K prompt did not finish in 2 hours. For long contexts, the CUDA server prefills at 580–740 tok/s.
 
 ## Validation
 

@@ -8,7 +8,7 @@
 # Settings (environment):
 #   MODEL_DIR   directory holding the 3 L3 shards (+ mmproj, dspark sidecar)   default ~/models/DeepSeek-V4.1-Flash-1017-REAP192-GGUF
 #   ENGRAM_DIR  directory holding engram_L1.v41rows / engram_L14.v41rows (NVMe) default $MODEL_DIR/engram_rows
-#   CTX         context length (the fork clamps to 16384 until the long-context mask is validated)  default 16384
+#   CTX         context length; above 16384 the candidate-block mask keys are added  default 16384 (32768 validated)
 #   VISION      1 = load the mmproj if present                                default 1 (0 with DSPARK=1)
 #   DSPARK      1 = speculative decoding with the DSpark sidecar               default 0
 #   DRAFT_N     tokens drafted per step with DSPARK=1                          default 3
@@ -53,6 +53,14 @@ if [ "$avail" -lt 100 ]; then
 fi
 
 args=(-m "$model" -ngl 999 -c "$CTX" -np 1 --jinja --host "$HOST" --port "$PORT")
+# Above 16384 tokens V4.1 attends through a two-level candidate-block selection (layer 20, 2048 blocks
+# of 8). The published GGUF predates the keys that enable it, so pass them; without them the context
+# is clamped to 16384.
+if [ "$CTX" -gt 16384 ]; then
+    args+=(--override-kv deepseek41.candidate.source_layer=int:20
+           --override-kv deepseek41.candidate.topk_blocks=int:2048
+           --override-kv deepseek41.candidate.block_size=int:8)
+fi
 
 mmproj=$MODEL_DIR/mmproj-DeepSeek-V4.1-Flash-1017-bf16.gguf
 if [ "$VISION" = 1 ]; then
